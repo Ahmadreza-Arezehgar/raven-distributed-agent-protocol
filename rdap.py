@@ -139,6 +139,7 @@ def cmd_start(args) -> None:
     repo = Path(st.get('repo') or BASE / 'team-repo')
     peers_file = PEERS_FILE if PEERS_FILE.exists() else None
     peers = load_peers()
+    saved_llm = st.get('llm', {})
     cfg = NodeConfig(
         name=st['name'],
         role=st.get('role', ''),
@@ -149,11 +150,44 @@ def cmd_start(args) -> None:
         allow_shell=bool(args.allow_shell),
         skills=[Skill(id='general', name='General tasks',
                       description='any delegated task')],
-        llm=LLMConfig(provider=args.provider, model=args.model or ''),
+        llm=LLMConfig(
+            provider=args.provider or saved_llm.get('provider', 'echo'),
+            model=args.model or saved_llm.get('model', ''),
+            base_url=args.base_url or saved_llm.get('base_url',
+                                                    LLMConfig.base_url),
+        ),
         trusted_peers=(load_trusted_peers(peers_file) if peers_file else {}),
         require_signed_tasks=bool(peers) and not args.open,
     )
     serve(cfg)
+
+
+def cmd_model(args) -> None:
+    """Show/save which brain this agent uses."""
+    st = state()
+    if not st.get('name'):
+        sys.exit('run `./rdap init` first')
+    if not args.provider:
+        cur = st.get('llm', {})
+        if cur:
+            print(f'current: {cur.get("provider")}/{cur.get("model", "-")} '
+                  f'@ {cur.get("base_url", "(default)")}')
+        else:
+            print('current: echo (keyless demo brain)')
+        print('set one:  ./rdap model <provider> [model] [--base-url URL]')
+        print('example:  ./rdap model openai llama3.2 '
+              '--base-url http://localhost:11434/v1')
+        return
+    st['llm'] = {
+        'provider': args.provider,
+        'model': args.model or '',
+        'base_url': args.base_url or '',
+    }
+    _save_json(STATE_FILE, st)
+    print(f"✔ {st['name']} will now think with "
+          f"{st['llm']['provider']}/{st['llm']['model'] or '-'}"
+          f"{' @ ' + st['llm']['base_url'] if st['llm']['base_url'] else ''}")
+    print('restart the node (`./rdap start`) to apply.')
 
 
 # ------------------------------------------------------------------ ask --
@@ -255,11 +289,19 @@ def main() -> None:
     s = sub.add_parser('start', help='serve this agent')
     s.add_argument('--port', type=int, default=0)
     s.add_argument('--ip', default='', help='override advertised ip')
-    s.add_argument('--provider', default='echo', help='echo | openai')
+    s.add_argument('--provider', default='', help='echo | openai (overrides saved)')
     s.add_argument('--model', default='')
+    s.add_argument('--base-url', default='', help='OpenAI-compatible endpoint')
     s.add_argument('--allow-shell', action='store_true')
     s.add_argument('--open', action='store_true', help='accept unsigned tasks too')
     s.set_defaults(fn=cmd_start)
+
+    m = sub.add_parser('model', help='choose this agent\'s brain (LLM)')
+    m.add_argument('provider', nargs='?', default='', help='openai | echo')
+    m.add_argument('model', nargs='?', default='')
+    m.add_argument('--base-url', default='',
+                   help='e.g. http://localhost:11434/v1 for Ollama')
+    m.set_defaults(fn=cmd_model)
 
     a = sub.add_parser('ask', help='delegate a task to a teammate')
     a.add_argument('text')
