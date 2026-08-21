@@ -157,6 +157,36 @@ def cmd_start(args) -> None:
 
 
 # ------------------------------------------------------------------ ask --
+def _probe(url: str, seconds: float = 6.0):
+    """Quick reachability + identity check. Returns identity dict or None."""
+    import httpx
+
+    base = url.rstrip('/') + '/'
+    try:
+        with httpx.Client(timeout=httpx.Timeout(seconds, connect=4.0)) as c:
+            c.get(base + 'health').raise_for_status()
+            return c.get(base + 'raven/identity').json()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def cmd_ping(args) -> None:
+    url = args.url
+    print(f'→ probing {url} …')
+    info = _probe(url)
+    if not info:
+        print('✗ node unreachable. checklist:')
+        print('  1. is `./rdap start` running on the other Mac?')
+        print('  2. macOS Firewall there: System Settings ▸ Network ▸ Firewall '
+              '→ allow Python (or turn firewall off while testing)')
+        print('  3. both Macs on the same Wi-Fi/LAN?')
+        sys.exit(1)
+    pol = info.get('policy', {})
+    print(f'✔ alive: {info["display"]}')
+    print(f'  signed-only={pol.get("require_signed_tasks")} '
+          f'peers={len(pol.get("trusted_peers", []))}')
+
+
 def cmd_ask(args) -> None:
     import asyncio
 
@@ -173,8 +203,7 @@ def cmd_ask(args) -> None:
         target = mates.get(args.name)
         target_name = args.name
         if not target or not target.get('url'):
-            sys.exit(f'no url known for "{args.name}" — they must run `./rdap start` '
-                     'and re-send their invite with URL, or pass --url here.')
+            sys.exit(f'no url known for "{args.name}" — re-run `./rdap trust` with --url')
     elif len(mates) == 1:
         target_name, target = next(iter(mates.items()))
     elif not mates:
@@ -193,9 +222,16 @@ def cmd_ask(args) -> None:
         target['url'] = args.url
         _save_json(STATE_FILE, st)
 
+    print(f'→ checking {target_name} at {url} …')
+    info = _probe(url)
+    if not info:
+        print(f'✗ {target_name} is unreachable at {url}.')
+        print('  run:  ./rdap ping ' + url)
+        sys.exit(1)
+    print(f'✔ {target_name} alive ({info["address"][:16]}…) — sending task …')
+
     idn = RavenIdentity.load_or_create(Path(st['repo']) / '.team' / 'keys')
-    print(f'→ delegating to {target_name} ({url}) …')
-    result = asyncio.run(send_task(url, args.text, identity=idn))
+    result = asyncio.run(send_task(url, args.text, identity=idn, timeout=90))
     print(result)
 
 
@@ -230,6 +266,10 @@ def main() -> None:
     a.add_argument('--name', default='', help='which teammate (when several)')
     a.add_argument('--url', default='')
     a.set_defaults(fn=cmd_ask)
+
+    g = sub.add_parser('ping', help='check whether a teammate node is reachable')
+    g.add_argument('url', help='http://<ip>:<port>')
+    g.set_defaults(fn=cmd_ping)
 
     args = p.parse_args()
     args.fn(args)
