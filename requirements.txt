@@ -1,0 +1,5 @@
+a2a-sdk>=1.1.2,<2
+httpx>=0.28
+uvicorn>=0.30
+starlette>=0.40
+cryptography>=44
