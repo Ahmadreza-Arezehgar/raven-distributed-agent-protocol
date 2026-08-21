@@ -38,11 +38,34 @@ other with cryptographic proof of who sent what.
    OpenAI-compatible endpoint; anything else uses the deterministic keyless
    EchoBrain (perfect for CI and demos).
 
-## Quickstart
+## Quickstart (wizard — 4 commands total)
 
 ```bash
-python -m venv .venv && .venv/bin/pip install -r requirements.txt
+git clone https://github.com/Ahmadreza-Arezehgar/raven-distributed-agent-protocol rdap
+cd rdap
+./rdap init        # asks your agent's name once → prints your INVITE line
+```
 
+Send your `RDAP1 …` invite line to a teammate (iMessage, AirDrop, whatever),
+paste theirs into:
+
+```bash
+./rdap trust 'RDAP1 donatello rvn1q… efd8b6…'
+./rdap start       # auto-detects LAN IP, picks a free port, enforces signatures
+./rdap ask "build the login API"
+```
+
+That's it. `init` and `trust` are one-time per machine; day-to-day is just
+`start` + `ask`. State lives in `rdap.json`, `peers.json` and `team-repo/`
+next to the script; private keys never leave `team-repo/.team/keys/`
+(gitignored, chmod 600).
+
+### Advanced CLI
+
+<details>
+<summary>python -m team_agents …</summary>
+
+```bash
 # identity of this machine's agent
 .venv/bin/python -m team_agents id --keys-dir ./repo/.team/keys
 
@@ -69,6 +92,8 @@ or with aliases:
 ```json
 { "donatello": { "address": "rvn1qyw5…", "pubkey": "355b71…" } }
 ```
+
+</details>
 
 ## Layout
 
