@@ -2,6 +2,12 @@
 # RDAP one-command launcher: ensures venv + deps, then runs the wizard.
 set -e
 cd "$(dirname "$0")"
-if [ ! -d .venv ]; then python3 -m venv .venv; fi
-.venv/bin/pip -q install -r requirements.txt 2>/dev/null || true
+if [ ! -d .venv ]; then
+  echo "* creating virtualenv…"
+  python3 -m venv .venv
+fi
+if ! .venv/bin/python -c "import a2a, uvicorn, starlette, cryptography, httpx" 2>/dev/null; then
+  echo "* installing dependencies (first run)…"
+  .venv/bin/pip install -r requirements.txt
+fi
 exec .venv/bin/python rdap.py "$@"
