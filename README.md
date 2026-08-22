@@ -153,11 +153,26 @@ or with aliases:
 
 ## Security notes
 
-- Private seeds never leave `<repo>/.team/keys/device_ed25519.seed` (mode 600)
-  and are gitignored by default.
-- Signatures cover the exact task text; any mutation invalidates them.
-- Replay window is bounded by the ±300 s timestamp check. For hostile
-  networks add nonces or run behind mTLS/bearer auth (`--token`).
+Private keys never leave `<repo>/.team/keys/device_ed25519.seed` (mode 600)
+and are gitignored by default. Signatures cover the exact task text; any
+mutation invalidates them. Replay window is bounded by the ±300 s timestamp
+check. For hostile networks add nonces or run behind mTLS/bearer auth
+(`--token`).
+
+## Configuration
+
+Zero-config by default. Customize via environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `RDAP_HOME` | `~/rdap` | root for state, keys, `bin/`, cloned sources |
+| `RDAP_POLL` | `20` | seconds between mesh/git inbox drains (`./rdap start --poll 8`) |
+| `RDAP_SWARM_BIN` | auto-discovered | explicit path to the raven-swarm mailbox binary |
+| `NO_COLOR` | unset | disable all terminal colors |
+
+Any OpenAI-compatible endpoint works as a brain — set it with
+`./rdap model <provider> <model> --base-url <url>` (OpenRouter, Groq,
+vLLM, LM Studio, Ollama …).
 
 ## Status
 

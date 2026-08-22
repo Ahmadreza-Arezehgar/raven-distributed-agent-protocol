@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+__version__ = '1.0.0'
+
 import sys
 from pathlib import Path
 
 
 def _bootstrap_protocol_path() -> None:
-    """Make the vendored raven_protocol reference importable from any layout."""
+    """Make the raven_protocol reference importable from any repo layout."""
     for base in Path(__file__).resolve().parents:
         ref = base / 'protocol' / 'reference'
         if ref.is_dir() and str(ref) not in sys.path:
