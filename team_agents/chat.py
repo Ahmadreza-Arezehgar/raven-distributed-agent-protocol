@@ -46,6 +46,7 @@ class TeamChat:
         self.goal_md.write_text(f'{header}{body}\n', encoding='utf-8')
         if self.memory.auto_commit:
             self.memory.commit_all('chore(goal): update team mission')
+            self.memory._git('push')   # share mission across machines now
 
     def get_goal(self) -> str:
         try:
@@ -66,6 +67,7 @@ class TeamChat:
         self._trim()
         if self.memory.auto_commit:
             self.memory.commit_all(f'chat: {sender}')
+            self.memory._git('push')   # best-effort live sync
 
     def tail(self, n: int = 30) -> str:
         self.ensure()
