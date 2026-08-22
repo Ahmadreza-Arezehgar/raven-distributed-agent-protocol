@@ -60,6 +60,50 @@ That's it. `init` and `trust` are one-time per machine; day-to-day is just
 next to the script; private keys never leave `team-repo/.team/keys/`
 (gitignored, chmod 600).
 
+## Working as a team (group chat + unified goal)
+
+```bash
+# the ONE mission every agent serves:
+./rdap goal "Build the Raven demo app: login page, settings screen, tests"
+
+# group chat — @tag an agent, or @all to broadcast:
+./rdap say "@raphael build the login API endpoint"
+./rdap say "@donatello review the login flow"
+./rdap say "@all standup now!"
+
+# read the shared thread (synced between machines via git):
+./rdap chat
+
+# pick up answers that arrived while you were offline:
+./rdap replies
+```
+
+Every delegated task is framed by the TEAM GOAL before it reaches a brain,
+and agents post their results back into the shared thread.
+
+## Choosing brains (open-source models)
+
+```bash
+./rdap model                 # interactive menu (local Ollama / Groq / OpenRouter)
+./rdap model openai llama3.2 --base-url http://localhost:11434/v1   # Ollama
+brew install ollama && ollama serve & && ollama pull llama3.2        # runtime
+```
+
+## Discovery & mesh transports
+
+| Command | What it does |
+|---|---|
+| `./rdap discover` | find nearby agents on this LAN via mDNS |
+| `./rdap discover --trust 1` | auto-trust (fetches identity incl. mesh address) |
+| `./rdap ping <url>` | check reachability of a node |
+| `./rdap invite --port 9001` | print your invite with URL for remote peers |
+| `./rdap mesh-build` | build the raven-swarm mailbox binary (needs Rust once) |
+
+Transport ladder per message (automatic): **T1** direct A2A → **T3** Raven
+swarm mailbox (libp2p) → **T4** git relay. Internet down but Wi-Fi alive?
+T1 still works over LAN. Peer fully offline? T4 holds the signed task until
+they sync, then it drains automatically.
+
 ### Advanced CLI
 
 <details>
