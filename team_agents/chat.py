@@ -15,28 +15,26 @@ import re
 import time
 from pathlib import Path
 
+from .deltas import DeltaStore
 from .memory import TeamMemory
 
 MAX_CHAT_LINES = 500
 
 
 class TeamChat:
-    def __init__(self, memory: TeamMemory) -> None:
+    def __init__(self, memory: TeamMemory, writer: str = 'user') -> None:
         self.memory = memory
+        self.delta = DeltaStore(memory, writer)
         self.goal_md = self.memory.resolve_in_repo('.team/GOAL.md')
-        self.chat_md = self.memory.resolve_in_repo('.team/chat/log.md')
 
     # -------------------------------------------------------------- layout --
     def ensure(self) -> None:
         self.memory.ensure_layout()
-        self.chat_md.parent.mkdir(parents=True, exist_ok=True)
         if not self.goal_md.exists():
             self.goal_md.parent.mkdir(parents=True, exist_ok=True)
             self.goal_md.write_text(
                 '# TEAM GOAL\n\n(not set — every agent works independently)\n',
                 encoding='utf-8')
-        if not self.chat_md.exists():
-            self.chat_md.write_text('# Team Chat\n', encoding='utf-8')
 
     # --------------------------------------------------------------- goal ---
     def set_goal(self, text: str) -> None:
@@ -59,26 +57,22 @@ class TeamChat:
 
     # --------------------------------------------------------------- chat ---
     def post(self, sender: str, text: str) -> None:
-        """Append one message to the shared thread."""
+        """Append one message as a delta — unique file, zero git conflicts."""
         self.ensure()
-        clean = text.replace('\n', ' ')
-        with self.chat_md.open('a', encoding='utf-8') as fh:
-            fh.write(f'- {time.strftime("%H:%M:%S")} **{sender}**: {clean}\n')
-        self._trim()
+        self.delta.write('chat', {'sender': sender, 'text': text.replace('\n', ' ')[:500]})
         if self.memory.auto_commit:
             self.memory.commit_all(f'chat: {sender}')
             self.memory._git('push')   # best-effort live sync
 
     def tail(self, n: int = 30) -> str:
         self.ensure()
-        lines = self.chat_md.read_text(encoding='utf-8').splitlines()[1:]
-        return '\n'.join(lines[-n:]) or '(empty)'
-
-    def _trim(self) -> None:
-        lines = self.chat_md.read_text(encoding='utf-8').splitlines()
-        if len(lines) > MAX_CHAT_LINES:
-            keep = [lines[0]] + lines[-(MAX_CHAT_LINES - 1):]
-            self.chat_md.write_text('\n'.join(keep) + '\n', encoding='utf-8')
+        recs = self.delta.read('chat')[-n:]
+        if not recs:
+            return '(empty)'
+        return '\n'.join(
+            f"- {time.strftime('%H:%M:%S', time.localtime(r.get('at', 0)))} "
+            f"**{r.get('sender', '?')}**: {r.get('text', '')}"
+            for r in recs)
 
 
 def parse_mentions(text: str, known: list[str]) -> list[str]:
