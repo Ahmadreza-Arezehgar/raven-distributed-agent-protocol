@@ -237,6 +237,8 @@ def cmd_start(args) -> None:
         trusted_peers_file=str(PEERS_FILE),
         require_signed_tasks=bool(peers_now) and not args.open,
     )
+    if args.poll:
+        os.environ['RDAP_POLL'] = str(args.poll)
     serve(cfg)
 
 
@@ -653,7 +655,7 @@ def cmd_ask(args) -> None:
 
 
 # ------------------------------------------------------------------ main --
-from team_agents.ui import ARROW, bold, cyan, dim, err, green, header, ok  # noqa: F401
+from team_agents.ui import ARROW, dim  # noqa: F401
 
 
 def _menu() -> None:
@@ -679,11 +681,14 @@ def _menu() -> None:
         pass
     mates = list(st.get('teammates', {}))
 
+    from team_agents import __version__
+
     ui.box([
         ('agent   ', f"{st['name']}" + (f" · {st['role']}" if st.get('role') else '')),
         ('raven id', st.get('address', '?')),
         ('goal    ', (goal[:38] + '…') if len(goal) > 40 else (goal or 'not set')),
         ('team    ', ', '.join(mates) if mates else 'nobody yet'),
+        ('version ', f'v{__version__}'),
     ], title='RDAP')
 
     print()
@@ -726,6 +731,26 @@ def cmd_status(args) -> None:
     ], title='RDAP status')
 
 
+def cmd_board(args) -> None:
+    """Show the shared task board (projection of task deltas)."""
+    import team_agents.ui as ui
+    from team_agents.memory import TeamMemory
+
+    st = state()
+    if not st.get('name'):
+        sys.exit('run `./rdap init` first')
+    m = TeamMemory(Path(st.get('repo') or BASE / 'team-repo'))
+    rows = m._parse_board_rows()
+    if not rows:
+        print(ui.dim('board is empty — agents add tasks with board_set_task'))
+        return
+    for r in rows:
+        icon = {'done': ui.green('●'), 'in_progress': ui.cyan('◐'),
+                'blocked': ui.red('○')}.get(r['status'], ui.dim('○'))
+        print(f"  {icon} {ui.bold(r['id']):<14} {r['title'][:44]:<46} "
+              f"{ui.dim(r['owner'])} {ui.dim(r['status'])}")
+
+
 def main() -> None:
     import argparse
 
@@ -754,6 +779,8 @@ def main() -> None:
     s.add_argument('--model', default='')
     s.add_argument('--base-url', default='', help='OpenAI-compatible endpoint')
     s.add_argument('--allow-shell', action='store_true')
+    s.add_argument('--poll', type=int, default=0,
+                   help='mesh/git drain interval seconds (default 20)')
     s.add_argument('--open', action='store_true', help='accept unsigned tasks too')
     s.set_defaults(fn=cmd_start)
 
@@ -807,6 +834,9 @@ def main() -> None:
 
     stt = sub.add_parser('status', help='one-glance dashboard')
     stt.set_defaults(fn=cmd_status)
+
+    bd = sub.add_parser('board', help='show the shared task board')
+    bd.set_defaults(fn=cmd_board)
 
     mb = sub.add_parser('mesh-build',
                         help='build the Raven swarm mailbox binary (Rust)')
