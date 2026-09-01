@@ -3,7 +3,7 @@
 
     ./rdap init          set up this Mac's agent (asks your agent's name)
     ./rdap trust         register a teammate by pasting their INVITE line
-    ./rdap start         run your agent node (auto IP/port)
+    ./rdap start         run your agent node (explicit, stable IP/port)
     ./rdap ask "task"    delegate a signed task to a teammate
 
 No flags needed for the happy path. Advanced flags still exist in
@@ -12,10 +12,15 @@ No flags needed for the happy path. Advanced flags still exist in
 
 from __future__ import annotations
 
+import argparse
+import copy
+import ipaddress
 import json
 import os
 import socket
+import stat
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -27,6 +32,7 @@ sys.path.insert(0, str(HERE))
 BASE = Path(os.environ.get('RDAP_HOME', str(HERE))).resolve()
 STATE_FILE = BASE / 'rdap.json'
 PEERS_FILE = BASE / 'peers.json'
+STATE_LOCK_FILE = BASE / '.rdap-state.lock'
 
 # open-source-first brain catalog
 MODEL_MENU = [
@@ -38,9 +44,9 @@ MODEL_MENU = [
     ('mistral',       'Mistral (7B)',                       'ollama'),
 ]
 CLOUD_MENU = [
-    ('groq/llama-3.3-70b-versatile',  'Groq · Llama 3.3 70B (fast, free tier)',
+    ('llama-3.3-70b-versatile',  'Groq · Llama 3.3 70B (fast, free tier)',
      'https://api.groq.com/openai/v1', 'GROQ_API_KEY'),
-    ('openrouter/llama-3.3-70b-instruct:free', 'OpenRouter · Llama 3.3 70B free',
+    ('meta-llama/llama-3.3-70b-instruct:free', 'OpenRouter · Llama 3.3 70B free',
      'https://openrouter.ai/api/v1', 'OPENROUTER_API_KEY'),
     ('gpt-4o-mini',                   'OpenAI · gpt-4o-mini (proprietary)',
      'https://api.openai.com/v1', 'OPENAI_API_KEY'),
@@ -49,18 +55,54 @@ CLOUD_MENU = [
 
 # --------------------------------------------------------------- helpers --
 def _load_json(path: Path, default):
+    if not path.exists():
+        return default
     try:
         return json.loads(path.read_text(encoding='utf-8'))
-    except Exception:  # noqa: BLE001
-        return default
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f'cannot read valid JSON from {path}: {exc}') from exc
 
 
 def _save_json(path: Path, data) -> None:
-    path.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
+    import tempfile
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f'.{path.name}.', suffix='.tmp'
+    )
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write(json.dumps(data, indent=2) + '\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        if os.name != 'nt':
+            try:
+                directory_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                # Some filesystems do not support directory fsync; the atomic
+                # replace itself has already succeeded.
+                pass
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def state() -> dict:
-    return _load_json(STATE_FILE, {})
+    try:
+        value = _load_json(STATE_FILE, {})
+    except ValueError as exc:
+        sys.exit(f'RDAP state is unavailable; refusing to overwrite it: {exc}')
+    if not isinstance(value, dict):
+        sys.exit('RDAP state must be a JSON object; refusing to overwrite it')
+    return value
 
 
 def lan_ip() -> str:
@@ -69,9 +111,57 @@ def lan_ip() -> str:
         s.connect(('8.8.8.8', 80))
         return s.getsockname()[0]
     except Exception:  # noqa: BLE001
-        return '127.0.0.1'
+        # Loopback is not a truthful cross-device address.  Callers require an
+        # explicit --ip when this machine has no usable default route.
+        return ''
     finally:
         s.close()
+
+
+def _validated_advertised_host(value: str) -> str:
+    """Return a URL-safe host supported by the current IPv4 listener."""
+    host = str(value).strip()
+    error = (
+        'advertised host must be an IPv4 address or URL-safe ASCII hostname; '
+        'raw IPv6 is not supported by the current listener'
+    )
+    if not host or len(host) > 253:
+        raise ValueError(error)
+    try:
+        parsed = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            host.encode('ascii')
+        except UnicodeEncodeError as exc:
+            raise ValueError(error) from exc
+        # Reject URL delimiters, whitespace, malformed labels, and a value that
+        # merely looks like a mistyped dotted IPv4 literal. Punycode hostnames
+        # remain available when a non-ASCII DNS name is genuinely needed.
+        labels = host.split('.')
+        if (
+            all(character.isdigit() or character == '.' for character in host)
+            or any(
+                not label
+                or len(label) > 63
+                or not label[0].isalnum()
+                or not label[-1].isalnum()
+                or any(
+                    not (character.isalnum() or character == '-')
+                    for character in label
+                )
+                for label in labels
+            )
+        ):
+            raise ValueError(error)
+        return host
+    if (
+        parsed.version != 4
+        or parsed.is_unspecified
+        or parsed.is_multicast
+        or int(parsed) == 0xFFFFFFFF
+    ):
+        raise ValueError(error)
+    return str(parsed)
 
 
 def ensure_keys(repo: Path) -> tuple[str, str]:
@@ -91,19 +181,108 @@ def rvn_display(address: str) -> str:
 
 
 def load_peers() -> dict:
-    return _load_json(PEERS_FILE, {})
+    if not PEERS_FILE.exists():
+        return {}
+    from team_agents.config import load_trusted_peers
+
+    return load_trusted_peers(PEERS_FILE)
 
 
 def save_peers(peers: dict) -> None:
+    from team_agents.raven_identity import validate_address_public_key
+
+    for address, public_key in peers.items():
+        validate_address_public_key(str(address), str(public_key))
     _save_json(PEERS_FILE, peers)
+
+
+def _merge_teammate_state(
+    name: str,
+    *,
+    expected_address: str,
+    expected_public_key: str,
+    updates: dict,
+) -> dict:
+    """Merge a verified endpoint observation without clobbering other state."""
+    from team_agents.memory import exclusive_file_lock
+
+    if not set(updates).issubset({'url', 'mailbox'}):
+        raise ValueError('unsupported teammate state update')
+    with exclusive_file_lock(STATE_LOCK_FILE, timeout=30.0):
+        current = state()
+        teammates = current.get('teammates')
+        if not isinstance(teammates, dict):
+            raise RuntimeError('teammate state is unavailable')
+        teammate = teammates.get(name)
+        if not isinstance(teammate, dict):
+            raise RuntimeError(f'teammate {name!r} changed while probing it')
+        if (
+            str(teammate.get('address', '')) != expected_address
+            or str(teammate.get('public_key', '')) != expected_public_key
+        ):
+            raise RuntimeError(
+                f'teammate {name!r} identity changed while probing it'
+            )
+        teammate.update(copy.deepcopy(updates))
+        _save_json(STATE_FILE, current)
+        return current
+
+
+def _configure_relay_git_identity(repo: Path) -> None:
+    """Make relay commits independent of machine-global Git configuration."""
+    import subprocess
+
+    try:
+        top_level = subprocess.run(
+            ['git', 'rev-parse', '--show-toplevel'],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if os.path.normcase(str(Path(top_level).resolve())) != os.path.normcase(
+            str(repo.resolve())
+        ):
+            sys.exit(
+                f'RDAP relay path is nested inside another repository: {repo}'
+            )
+        for key, value in (
+            ('user.name', 'RDAP Agent'),
+            ('user.email', 'rdap@localhost.invalid'),
+        ):
+            subprocess.run(
+                ['git', 'config', '--local', key, value],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+    except FileNotFoundError:
+        sys.exit('RDAP initialization failed: Git is not installed or not on PATH')
+    except subprocess.CalledProcessError as exc:
+        detail = ((exc.stderr or '') + (exc.stdout or '')).strip()[-1000:]
+        sys.exit(f'RDAP Git identity configuration failed: {detail or exc}')
 
 
 # ----------------------------------------------------------------- init --
 def cmd_init(args) -> None:
+    """Serialize the whole first-run transaction for one RDAP home."""
+    from team_agents.memory import exclusive_file_lock
+
+    with exclusive_file_lock(STATE_LOCK_FILE, timeout=30.0):
+        _cmd_init_locked(args)
+
+
+def _cmd_init_locked(args) -> None:
     import team_agents.ui as ui
 
     st = state()
     if st.get('name'):
+        # Re-running init is also the migration path for homes created by
+        # versions that accidentally depended on global Git identity.
+        _configure_relay_git_identity(
+            Path(st.get('repo') or BASE / 'team-repo').resolve()
+        )
         ui.ok(f'already initialized as "{st["name"]}"')
         print(ui.dim('invite: ') + invite_line(st))
         return
@@ -111,6 +290,10 @@ def cmd_init(args) -> None:
     repo = BASE / 'team-repo'
     default_name = socket.gethostname().split('.')[0].lower()
     name = args.name or input(f'agent name [{default_name}]: ').strip() or default_name
+    try:
+        _validate_mate_name(name)
+    except ValueError as exc:
+        sys.exit(f'invalid agent name: {exc}')
     if args.role or not sys.stdin.isatty():
         role = args.role
     else:
@@ -118,19 +301,117 @@ def cmd_init(args) -> None:
 
     print(ui.dim('* generating raven identity…'))
     repo.mkdir(parents=True, exist_ok=True)
-    (repo / '.gitignore').write_text(
-        '.team/keys/\n*.seed\n'
-        '.team/mesh-client/\n.team/mesh-store/\n.team/mesh-seen.json\n',
-        encoding='utf-8')
-    if not (repo / '.git').exists():
-        import subprocess as _sp
+    repo_metadata = os.lstat(repo)
+    if repo.is_symlink() or not stat.S_ISDIR(repo_metadata.st_mode):
+        sys.exit('RDAP initialization refused: team-repo must be a real directory')
+    import subprocess as _sp
 
-        _sp.run(['git', 'init', '-q'], cwd=repo, check=False)
-        _sp.run(['git', 'add', '-A'], cwd=repo, check=False)
-        _sp.run(['git', 'commit', '-q', '-m', 'init team memory',
-                 '--allow-empty'], cwd=repo, check=False)
+    def checked_git(*git_args: str) -> _sp.CompletedProcess:
+        try:
+            return _sp.run(
+                ['git', *git_args],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            sys.exit('RDAP initialization failed: Git is not installed or not on PATH')
+        except _sp.CalledProcessError as exc:
+            detail = ((exc.stderr or '') + (exc.stdout or '')).strip()[-1000:]
+            sys.exit(f'RDAP Git initialization failed: {detail or exc}')
+
+    git_marker = repo / '.git'
+    existed_before_git_init = {entry.name for entry in repo.iterdir()}
+    if not git_marker.exists():
+        unexpected = existed_before_git_init - {'.gitignore'}
+        if unexpected:
+            sys.exit(
+                'RDAP initialization refused: team-repo already contains '
+                'unmanaged files: ' + ', '.join(sorted(unexpected)[:12])
+            )
+        checked_git('init', '-q')
+    elif git_marker.is_symlink() or not git_marker.is_dir():
+        sys.exit('RDAP initialization refused: .git must be a real directory')
+    # This is a purpose-specific relay repository. Configure a non-personal
+    # local identity on every device, including clones that already have HEAD,
+    # so future relay commits never depend on machine-global Git settings.
+    _configure_relay_git_identity(repo)
+    try:
+        has_head = _sp.run(
+            ['git', 'rev-parse', '--verify', 'HEAD'],
+            cwd=repo,
+            check=False,
+            stdout=_sp.DEVNULL,
+            stderr=_sp.DEVNULL,
+        ).returncode == 0
+    except FileNotFoundError:
+        sys.exit('RDAP initialization failed: Git is not installed or not on PATH')
+
+    if not has_head:
+        unexpected = {
+            entry.name for entry in repo.iterdir()
+            if entry.name not in {'.git', '.gitignore'}
+        }
+        if unexpected:
+            sys.exit(
+                'RDAP initialization refused: an unborn relay repository '
+                'contains unmanaged files: ' + ', '.join(sorted(unexpected)[:12])
+            )
+
+    ignore_rules = (
+        '.team/keys/',
+        '*.seed',
+        '.team/mesh-client/',
+        '.team/mesh-store/',
+        '.team/mesh-seen.json',
+        '.team/replay-cache.sqlite3*',
+    )
+
+    def merge_ignore_file(path: Path) -> None:
+        from team_agents.memory import _atomic_write_shared_text
+
+        existing = ''
+        try:
+            metadata = os.lstat(path)
+        except FileNotFoundError:
+            metadata = None
+        if metadata is not None:
+            if (
+                path.is_symlink()
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_size > 1024 * 1024
+            ):
+                sys.exit(f'RDAP initialization refused unsafe ignore file: {path}')
+            existing = path.read_text(encoding='utf-8')
+        rendered = existing
+        if rendered and not rendered.endswith('\n'):
+            rendered += '\n'
+        present = set(existing.splitlines())
+        missing = [rule for rule in ignore_rules if rule not in present]
+        if missing:
+            rendered += ''.join(f'{rule}\n' for rule in missing)
+        if metadata is None or rendered != existing:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_shared_text(path, rendered)
+
+    # A repository with history may have a project-owned .gitignore; preserve
+    # it byte-for-byte and apply the private runtime exclusions locally.
+    if not has_head:
+        merge_ignore_file(repo / '.gitignore')
+    merge_ignore_file(repo / '.git' / 'info' / 'exclude')
+
+    if not has_head:
+        checked_git('add', '--', '.gitignore')
+        checked_git('commit', '-q', '-m', 'init team memory')
 
     address, pub = ensure_keys(repo)
+    # A configured trust policy must fail closed if it later disappears.  Give
+    # fresh (and pre-policy) wizard homes an explicit, valid empty policy so a
+    # new node can still start cleanly before its first teammate is invited.
+    if not PEERS_FILE.exists():
+        _save_json(PEERS_FILE, {})
 
     # internet capability shapes which brains we offer later
     if args.internet is not None:
@@ -143,7 +424,15 @@ def cmd_init(args) -> None:
     st['internet'] = has_net
 
     st.update(name=name, role=role, repo=str(repo), address=address, public_key=pub)
-    _save_json(STATE_FILE, st)
+    current = state()
+    if current.get('name') and current.get('name') != name:
+        sys.exit(
+            'another init completed concurrently with a different name; '
+            'refusing to overwrite it'
+        )
+    current.update(st)
+    _save_json(STATE_FILE, current)
+    st = current
 
     ui.box([
         ('identity ', address),
@@ -161,45 +450,304 @@ def invite_line(st: dict) -> str:
     return f'RDAP1 {st["name"]} {st["address"]} {st["public_key"]}'
 
 
+def cmd_relay_setup(args) -> None:
+    """Attach this initialized team repository to one explicit shared remote."""
+    import subprocess
+
+    from team_agents.memory import TeamMemory
+
+    st = state()
+    if not st.get('name'):
+        sys.exit('run `./rdap init` first')
+    remote_url = str(args.remote_url)
+    if (
+        not remote_url
+        or remote_url.startswith('-')
+        or any(ord(character) < 32 for character in remote_url)
+    ):
+        sys.exit('invalid relay remote URL/path')
+    repo = Path(st.get('repo') or BASE / 'team-repo')
+    memory = TeamMemory(repo)
+    try:
+        existing = memory._git_checked('remote').splitlines()
+    except Exception as exc:
+        sys.exit(f'relay setup failed: {exc}')
+    if existing:
+        sys.exit(
+            'relay setup refused: repository already has remote(s): '
+            + ', '.join(existing)
+        )
+    try:
+        memory._git_checked('remote', 'add', 'origin', remote_url)
+        memory._git_checked(
+            'push', '--set-upstream', '--no-tags', 'origin', 'HEAD'
+        )
+        memory.require_shared_upstream()
+    except Exception as exc:
+        subprocess.run(
+            ['git', '-C', str(repo), 'remote', 'remove', 'origin'],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        sys.exit(f'relay setup failed; no upstream was configured: {exc}')
+    print('✔ Git relay upstream configured and initial state pushed.')
+    print('  On the second device, clone this same remote as $RDAP_HOME/team-repo')
+    print('  before running `./rdap init`.')
+
+
+def _validated_node_url(value: str) -> str:
+    """Return a normalized HTTP(S) node base URL with no userinfo."""
+    from urllib.parse import unquote, urlsplit, urlunsplit
+
+    raw = str(value)
+    if not raw or raw != raw.strip():
+        raise ValueError('URL must be non-empty and have no surrounding whitespace')
+    decoded = unquote(raw)
+    if '\\' in decoded or any(
+        char.isspace() or ord(char) < 32 or ord(char) == 127 for char in decoded
+    ):
+        raise ValueError('URL contains whitespace, control characters, or backslashes')
+    try:
+        parsed = urlsplit(raw)
+        hostname = parsed.hostname
+        # Accessing .port performs its validation (range and numeric syntax).
+        parsed.port
+    except ValueError as exc:
+        raise ValueError(f'malformed URL authority: {exc}') from exc
+    if parsed.scheme.lower() not in {'http', 'https'}:
+        raise ValueError('URL scheme must be http or https')
+    if not parsed.netloc or not hostname:
+        raise ValueError('URL must include a hostname')
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError('URL credentials are not allowed')
+    if '%' in parsed.netloc:
+        raise ValueError('percent-encoding is not allowed in the URL authority')
+    if parsed.query or parsed.fragment:
+        raise ValueError('URL query strings and fragments are not allowed')
+    decoded_segments = unquote(parsed.path).split('/')
+    if any(segment in {'.', '..'} for segment in decoded_segments):
+        raise ValueError('URL path traversal segments are not allowed')
+    path = parsed.path.rstrip('/')
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc, path, '', ''))
+
+
+def _resolve_server_auth_token(token_file: str = '') -> str:
+    """Resolve only this node's inbound Bearer credential."""
+    from team_agents.config import read_secret_file
+
+    path = str(token_file or os.environ.get('TEAM_AUTH_TOKEN_FILE', ''))
+    if path:
+        return read_secret_file(path)
+    return os.environ.get('TEAM_AUTH_TOKEN', '')
+
+
+def _reject_multi_peer_bearer(
+    token: str,
+    targets: dict[str, dict],
+    operation: str,
+) -> None:
+    """Never reuse one outbound peer credential across distinct identities."""
+    if not token:
+        return
+    identities = {
+        (
+            str(mate.get('address', '')),
+            str(mate.get('public_key', '')).lower(),
+        )
+        if mate.get('address') and mate.get('public_key')
+        else ('unresolved-name', str(name))
+        for name, mate in targets.items()
+    }
+    if len(identities) > 1:
+        sys.exit(
+            f'{operation} refuses to reuse one Bearer credential across multiple '
+            "peers; target one teammate at a time with that peer's --token-file"
+        )
+
+
+def _normalized_mate_name(value: str) -> str:
+    return str(value).casefold().replace('-', '').replace('_', '').replace(' ', '')
+
+
+def _validate_mate_name(value: str) -> str:
+    from team_agents.config import validate_node_name
+
+    name = validate_node_name(str(value))
+    key = _normalized_mate_name(name)
+    if not key or key in {'all', 'team', 'everyone'}:
+        raise ValueError('name is empty after normalization or is a reserved group mention')
+    return key
+
+
+def _mate_name_collisions(mates: dict[str, dict], name: str) -> list[str]:
+    key = _normalized_mate_name(name)
+    return sorted(
+        existing
+        for existing in mates
+        if existing != name and _normalized_mate_name(existing) == key
+    )
+
+
+def _ensure_unambiguous_mates(mates: dict[str, dict]) -> None:
+    groups: dict[str, list[str]] = {}
+    for name in mates:
+        groups.setdefault(_normalized_mate_name(name), []).append(name)
+    ambiguous = [sorted(names) for names in groups.values() if len(names) > 1]
+    if ambiguous:
+        rendered = '; '.join(', '.join(names) for names in ambiguous)
+        sys.exit(
+            'ambiguous saved teammate aliases; remove/re-trust duplicates before '
+            f'routing tasks: {rendered}'
+        )
+
+
+def _terminal_safe(value: object, limit: int = 80) -> str:
+    """Bound and strip terminal controls/bidi marks from untrusted discovery text."""
+    import unicodedata
+
+    return ''.join(
+        char
+        for char in str(value)
+        if char.isprintable() and not unicodedata.category(char).startswith('C')
+    )[:limit]
+
+
 # ---------------------------------------------------------------- trust --
 def cmd_trust(args) -> None:
+    from team_agents.memory import exclusive_file_lock
+    from team_agents.raven_identity import validate_address_public_key
+
     line = args.invite
     if not line:
         print("paste teammate's INVITE line, then press enter:")
         line = input('> ').strip()
 
     parts = line.split()
-    if len(parts) != 4 or parts[0] != 'RDAP1':
-        sys.exit('invalid invite — expected: RDAP1 <name> <rvn1...> <64-hex pubkey>')
-    _, tname, addr, pub = parts
-    if not addr.startswith('rvn1q') or len(pub) != 64:
-        sys.exit('invalid invite fields')
-
-    peers = load_peers()
-    peers[addr] = pub
-    save_peers(peers)
+    if len(parts) not in {4, 5} or parts[0] != 'RDAP1':
+        sys.exit(
+            'invalid invite — expected: RDAP1 <name> <rvn1...> '
+            '<64-hex pubkey> [http(s)://host:port]'
+        )
+    _, tname, addr, pub = parts[:4]
+    try:
+        _validate_mate_name(tname)
+        validate_address_public_key(addr, pub)
+    except ValueError as exc:
+        sys.exit(f'invalid invite: {exc}')
 
     st = state()
+    original_state = copy.deepcopy(st)
     mates = st.setdefault('teammates', {})
-    mate = mates.get(tname, {})
-    mate.update(address=addr, public_key=pub, url=args.url or mate.get('url', ''))
+    collisions = _mate_name_collisions(mates, tname)
+    if collisions:
+        sys.exit(
+            f'teammate name "{tname}" conflicts with saved alias(es) '
+            f'{", ".join(collisions)}; trust was not stored'
+        )
 
-    # if a url is known, pull their live identity — captures mesh mailbox info
-    if args.url:
+    invite_url = ''
+    cli_url = ''
+    try:
+        if len(parts) == 5:
+            invite_url = _validated_node_url(parts[4])
+        if getattr(args, 'url', ''):
+            cli_url = _validated_node_url(args.url)
+    except ValueError as exc:
+        sys.exit(f'invalid teammate URL: {exc}')
+    if invite_url and cli_url and invite_url != cli_url:
+        sys.exit('invite URL conflicts with --url; trust was not stored')
+    verified_url = cli_url or invite_url
+
+    # A supplied endpoint is part of the trust decision: verify its live Raven
+    # identity against the invite pin before writing either peers.json or state.
+    idn = None
+    if verified_url:
         try:
-            import httpx
+            idn = _probe(
+                verified_url,
+                expected_address=addr,
+                expected_public_key=pub,
+                token_file=getattr(args, 'token_file', ''),
+                raise_errors=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            sys.exit(f'live identity verification failed; trust was not stored: {exc}')
+        if idn is None:
+            sys.exit('live identity verification failed; trust was not stored')
 
-            idn = httpx.get(args.url.rstrip('/') + '/raven/identity',
-                            timeout=6).json()
-            if idn.get('mailbox'):
-                mate['mailbox'] = idn['mailbox']
-                print(f"  +mesh captured ({idn['mailbox']['multiaddr'][:34]}…)")
-        except Exception:  # noqa: BLE001
-            print('  (identity fetch failed — mailbox info skipped)')
+    mate = dict(mates.get(tname, {}))
+    old_address = str(mate.get('address', ''))
+    same_identity = (
+        mate.get('address') == addr
+        and str(mate.get('public_key', '')).lower() == pub.lower()
+    )
+    if not same_identity:
+        mate.pop('mailbox', None)
+    mate.update(address=addr, public_key=pub)
+    if verified_url:
+        mate['url'] = verified_url
+    elif not same_identity:
+        mate['url'] = ''
+    if (
+        verified_url
+        and getattr(args, 'experimental_plaintext_mailbox', False)
+        and idn
+        and idn.get('mailbox')
+    ):
+        mate['mailbox'] = idn['mailbox']
+        print(
+            '  ! EXPERIMENTAL PLAINTEXT mailbox captured '
+            f"({idn['mailbox']['multiaddr'][:34]}…)"
+        )
+
+    peers = load_peers()
+    final_peers = dict(peers)
+    old_still_referenced = any(
+        name != tname and str(saved.get('address', '')) == old_address
+        for name, saved in mates.items()
+    )
+    if old_address and old_address != addr and not old_still_referenced:
+        final_peers.pop(old_address, None)
+    final_peers[addr] = pub
+
+    # Cross-file updates cannot be one filesystem transaction.  Revoke only
+    # the identities changing in this operation first, then publish the UI
+    # state, and finally enable the new peer.  Every interruption point is
+    # therefore fail-closed rather than leaving a hidden authorized identity.
+    visible_before = {
+        str(saved.get('address', '')) for saved in mates.values()
+        if saved.get('address')
+    }
+    safe_peers = dict(peers)
+    if old_address and old_address != addr and not old_still_referenced:
+        safe_peers.pop(old_address, None)
+    if addr not in visible_before:
+        safe_peers.pop(addr, None)
 
     mates[tname] = mate
-    _save_json(STATE_FILE, st)
+    with exclusive_file_lock(STATE_LOCK_FILE, timeout=30.0):
+        if state() != original_state or load_peers() != peers:
+            sys.exit(
+                'trust state changed concurrently; nothing from this attempt was '
+                'stored—retry with the fresh teammate list'
+            )
+        safe_written = safe_peers != peers
+        if safe_written:
+            save_peers(safe_peers)
+        try:
+            _save_json(STATE_FILE, st)
+        except Exception:
+            if safe_written:
+                try:
+                    save_peers(peers)
+                except Exception:  # noqa: BLE001
+                    pass  # changed identities remain denied if rollback also fails
+            raise
+        save_peers(final_peers)
 
+    if verified_url:
+        print(f'  ✔ live identity verified at {verified_url}')
     print(f'✔ "{tname}" trusted ({addr})')
 
 
@@ -213,37 +761,98 @@ def cmd_start(args) -> None:
         sys.exit('run `./rdap init` first')
 
     repo = Path(st.get('repo') or BASE / 'team-repo')
+    from team_agents.raven_identity import validate_address_public_key
+
+    # One-time migration for wizard homes created before peers.json became a
+    # mandatory hot-reloaded policy file.  Runtime loss after this point is not
+    # recreated by the server and therefore remains fail-closed.
+    if not PEERS_FILE.exists():
+        _save_json(PEERS_FILE, {})
+    local_address, local_public_key = ensure_keys(repo)
+    try:
+        validate_address_public_key(local_address, local_public_key)
+    except ValueError as exc:
+        sys.exit(f'local Raven identity is invalid: {exc}')
+    if st.get('address') and st['address'] != local_address:
+        sys.exit('saved RDAP address does not match the local private key')
     # always wire the live peers file — trust list may grow while running
     peers_now = load_trusted_peers(PEERS_FILE) if PEERS_FILE.exists() else {}
     saved_llm = st.get('llm', {})
+    provider_overridden = bool(str(args.provider).strip())
+    selected_provider = str(
+        args.provider or saved_llm.get('provider', 'echo')
+    ).strip().lower()
+    if selected_provider == 'custom':
+        from team_agents.config import resolve_custom_llm_api_key
+
+        try:
+            custom_llm_key = resolve_custom_llm_api_key()
+        except Exception as exc:
+            sys.exit(f'custom LLM credential unavailable: {exc}')
+    else:
+        custom_llm_key = ''
+    advertised_ip = args.ip or lan_ip()
+    if not advertised_ip:
+        sys.exit(
+            'cannot determine a cross-device address (no default route); '
+            'pass this device\'s LAN address with `./rdap start --ip <LAN-IP>`'
+        )
+    try:
+        advertised_ip = _validated_advertised_host(advertised_ip)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    try:
+        selected_llm = LLMConfig(
+            provider=selected_provider,
+            model=(
+                args.model
+                or ('' if provider_overridden else saved_llm.get('model', ''))
+            ),
+            base_url=(
+                args.base_url
+                or (
+                    ''
+                    if provider_overridden
+                    else saved_llm.get('base_url', '')
+                )
+            ),
+            _api_key=custom_llm_key,
+        )
+    except ValueError as exc:
+        sys.exit(f'invalid LLM configuration: {exc}')
     cfg = NodeConfig(
         name=st['name'],
         role=st.get('role', ''),
         host='0.0.0.0',
-        advertised_host=args.ip or lan_ip(),
-        port=args.port or 9001,   # starting point; serve() bumps if busy
+        advertised_host=advertised_ip,
+        port=args.port or 9001,
         repo_path=repo,
         allow_shell=bool(args.allow_shell),
         skills=[Skill(id='general', name='General tasks',
                       description='any delegated task')],
-        llm=LLMConfig(
-            provider=args.provider or saved_llm.get('provider', 'echo'),
-            model=args.model or saved_llm.get('model', ''),
-            base_url=(args.base_url
-                      or saved_llm.get('base_url')
-                      or LLMConfig.base_url),
-        ),
+        llm=selected_llm,
         trusted_peers=peers_now,
         trusted_peers_file=str(PEERS_FILE),
-        require_signed_tasks=bool(peers_now) and not args.open,
+        require_signed_tasks=not args.open,
+        auth_token=_resolve_server_auth_token(args.token_file),
+        enable_experimental_mailbox=args.experimental_plaintext_mailbox,
     )
+    if args.poll and not 1 <= args.poll <= 3600:
+        sys.exit('--poll must be between 1 and 3600 seconds')
     if args.poll:
         os.environ['RDAP_POLL'] = str(args.poll)
+    if args.open:
+        print('! ! ! OPEN MODE EXPLICITLY ENABLED: unsigned LAN tasks will execute ! ! !')
+    if args.experimental_plaintext_mailbox:
+        print('! EXPERIMENTAL PLAINTEXT MAILBOX ENABLED — no Raven E2EE/confidentiality')
     serve(cfg)
 
 
 def cmd_model(args) -> None:
     """Show/save which brain this agent uses."""
+    from team_agents.config import LLMConfig
+    from team_agents.memory import exclusive_file_lock
+
     st = state()
     if not st.get('name'):
         sys.exit('run `./rdap init` first')
@@ -257,24 +866,31 @@ def cmd_model(args) -> None:
         print('\n— open-source, runs locally (Ollama) —')
         for i, (model, label, _) in enumerate(MODEL_MENU, 1):
             print(f'  {i:2}) {label}')
-            options.append(('openai', model, 'http://localhost:11434/v1', ''))
+            options.append(('ollama', model, 'http://localhost:11434/v1', ''))
         if has_net:
             print('— hosted —')
             for key, label, base_url, envkey in CLOUD_MENU:
                 print(f'  {len(options) + 1:2}) {label}')
-                options.append(('openai', key, base_url, envkey))
+                provider = {
+                    'GROQ_API_KEY': 'groq',
+                    'OPENROUTER_API_KEY': 'openrouter',
+                    'OPENAI_API_KEY': 'openai',
+                }[envkey]
+                options.append((provider, key, base_url, envkey))
         pick = input('\n#? (enter to keep current): ').strip()
         if not pick:
-            return cmd_model(type('A', (), {'provider': '', 'model': '',
-                                            'base_url': '', 'list': False})())
+            return
         try:
-            provider, model, base_url, envkey = options[int(pick) - 1]
+            selection = int(pick)
+            if not 1 <= selection <= len(options):
+                raise ValueError
+            provider, model, base_url, envkey = options[selection - 1]
         except (ValueError, IndexError):
             sys.exit('bad choice')
         if envkey:
             import os
 
-            if not os.environ.get(envkey) and not os.environ.get('LLM_API_KEY'):
+            if not os.environ.get(envkey):
                 print(f'⚠ set {envkey} before starting: export {envkey}=…')
         args.provider, args.model, args.base_url = provider, model, base_url
 
@@ -285,12 +901,33 @@ def cmd_model(args) -> None:
             print(' cloud:', label)
         return
 
-    st['llm'] = {
-        'provider': args.provider,
-        'model': args.model or '',
-        'base_url': args.base_url or LLMConfig.base_url,
+    selected_provider = str(args.provider).strip().lower()
+    try:
+        custom_llm_key = ''
+        if selected_provider == 'custom':
+            from team_agents.config import resolve_custom_llm_api_key
+
+            custom_llm_key = resolve_custom_llm_api_key()
+        validated_llm = LLMConfig(
+            provider=selected_provider,
+            model=args.model or '',
+            base_url=args.base_url or LLMConfig.base_url,
+            _api_key=custom_llm_key,
+        )
+    except Exception as exc:
+        sys.exit(f'invalid LLM configuration: {exc}')
+    selected = {
+        'provider': validated_llm.provider,
+        'model': validated_llm.model,
+        'base_url': validated_llm.base_url,
     }
-    _save_json(STATE_FILE, st)
+    with exclusive_file_lock(STATE_LOCK_FILE, timeout=30.0):
+        current = state()
+        if not current.get('name'):
+            sys.exit('RDAP state changed while selecting a model; run init first')
+        current['llm'] = selected
+        _save_json(STATE_FILE, current)
+        st = current
     print(f"✔ {st['name']} will now think with "
           f"{st['llm']['provider']}/{st['llm']['model'] or '-'}"
           f"{' @ ' + st['llm']['base_url'] if st['llm']['base_url'] else ''}")
@@ -305,7 +942,17 @@ def cmd_invite(args) -> None:
     url = ''
     mates = st.get('teammates', {})
     if args.port:
-        url = f'http://{lan_ip()}:{args.port}'
+        advertised_ip = args.ip or lan_ip()
+        if not advertised_ip:
+            sys.exit(
+                'cannot determine a cross-device address (no default route); '
+                'pass `./rdap invite --ip <LAN-IP> --port <PORT>`'
+            )
+        try:
+            advertised_ip = _validated_advertised_host(advertised_ip)
+        except ValueError as exc:
+            sys.exit(str(exc))
+        url = f'http://{advertised_ip}:{args.port}'
         line += f' {url}'
     print(line)
 
@@ -313,50 +960,159 @@ def cmd_invite(args) -> None:
 def cmd_discover(args) -> None:
     """Find nearby RDAP agents on this LAN via mDNS and optionally trust one."""
     from team_agents.discovery import browse
+    from team_agents.memory import exclusive_file_lock
 
+    if getattr(args, 'token_file', ''):
+        sys.exit(
+            'discover never sends Bearer credentials to untrusted TOFU endpoints; '
+            'exchange `./rdap invite` lines and use `./rdap trust ... '
+            '--token-file <peer-token>` instead'
+    )
     print('→ scanning LAN for RDAP agents (_rdap._tcp) …')
     me = state().get('address')
-    nodes = [n for n in browse(timeout=args.timeout) if n.get('addr') != me]
+    nodes = []
+    for discovered in browse(timeout=args.timeout):
+        if discovered.get('addr') == me:
+            continue
+        try:
+            safe_name = str(discovered.get('name', ''))
+            _validate_mate_name(safe_name)
+            safe_url = _validated_node_url(str(discovered.get('url', '')))
+        except ValueError:
+            print('  ! ignored an unsafe mDNS advertisement')
+            continue
+        node = dict(discovered)
+        node['name'] = safe_name
+        node['url'] = safe_url
+        node['_display_addr'] = _terminal_safe(node.get('addr', ''), 24)
+        nodes.append(node)
     if not nodes:
         print('none found (other than you). is the other node running?')
         return
     for i, n in enumerate(nodes, 1):
-        print(f"  {i}) {n['name']:20} {n['url']}  {n['addr'][:18]}…")
+        print(
+            f"  {i}) {n['name']:20} {n['url']}  "
+            f"{n['_display_addr'][:18]}…"
+        )
     if not args.trust:
         print('\ntrust one:  ./rdap discover --trust <number>')
         return
-    idx = int(args.trust) - 1 if args.trust != 'all' else None
-    targets = [nodes[idx]] if idx is not None else nodes
+    if str(args.trust).casefold() == 'all':
+        targets = nodes
+    else:
+        try:
+            selection = int(args.trust)
+        except (TypeError, ValueError):
+            sys.exit("--trust must be a listed number or 'all'")
+        if not 1 <= selection <= len(nodes):
+            sys.exit(f'--trust selection must be between 1 and {len(nodes)}')
+        targets = [nodes[selection - 1]]
     import httpx
 
     st = state()
     peers = load_peers()
+    from team_agents.client import get_bounded_json, verify_agent_card_document
+    from team_agents.raven_identity import validate_address_public_key
+
+    def public_json(url: str):
+        # RDAP node URLs are direct endpoints.  In particular, never let a
+        # process-wide HTTP_PROXY turn a loopback/LAN request into a credential
+        # or TOFU-boundary crossing.
+        with httpx.Client(timeout=6, trust_env=False) as public_client:
+            return get_bounded_json(public_client, url)
+
     for n in targets:
+        node_name = str(n.get('name', ''))
         try:
-            idn = httpx.get(n['url'] + '/raven/identity', timeout=6).json()
-        except Exception as exc:  # noqa: BLE001
-            print(f"✗ {n['name']}: identity fetch failed ({exc!r})")
+            _validate_mate_name(node_name)
+            collisions = _mate_name_collisions(
+                st.setdefault('teammates', {}), node_name
+            )
+            if collisions:
+                raise ValueError(
+                    f'name conflicts with saved alias(es) {", ".join(collisions)}'
+                )
+        except ValueError as exc:
+            print(f'✗ {node_name or "(unnamed)"}: unsafe teammate name ({exc})')
             continue
-        addr, pub = idn['address'], idn['public_key']
-        peers[addr] = pub
-        save_peers(peers)
+        try:
+            node_url = _validated_node_url(str(n['url']))
+            idn = public_json(node_url + '/raven/identity')
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in {401, 403}:
+                print(
+                    f'✗ {node_name}: identity requires auth; use a signed '
+                    'invite and manual `rdap trust`'
+                )
+                continue
+            print(f'✗ {node_name}: identity fetch failed ({exc!r})')
+            continue
+        except Exception as exc:  # noqa: BLE001
+            print(f'✗ {node_name}: identity fetch failed ({exc!r})')
+            continue
+        if not isinstance(idn, dict):
+            print(f'✗ {node_name}: identity response is not a JSON object')
+            continue
+        addr, pub = str(idn.get('address', '')), str(idn.get('public_key', ''))
+        try:
+            validate_address_public_key(addr, pub)
+            if n.get('addr') and n['addr'] != addr:
+                raise ValueError('mDNS address differs from HTTP identity')
+        except ValueError as exc:
+            print(f'✗ {node_name}: invalid identity binding ({exc})')
+            continue
+        existing_mate = st.setdefault('teammates', {}).get(node_name, {})
+        if existing_mate and (
+            str(existing_mate.get('address', '')) != addr
+            or str(existing_mate.get('public_key', '')).lower() != pub.lower()
+        ):
+            print(
+                f'✗ {node_name}: saved identity changed; exchange a signed invite '
+                'and use manual `rdap trust` for an authenticated rotation'
+            )
+            continue
+        try:
+            verify_agent_card_document(
+                public_json(node_url + '/.well-known/agent-card.json'),
+                expected_address=addr,
+                expected_public_key=pub,
+                expected_url=node_url,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f'✗ {node_name}: signed Agent Card verification failed ({exc!r})')
+            continue
+        original_state = copy.deepcopy(st)
+        original_peers = dict(peers)
         mates = st.setdefault('teammates', {})
-        mates[n['name']] = {'address': addr, 'public_key': pub,
-                            'url': n['url'], 'mailbox': idn.get('mailbox')}
-        print(f"✔ trusted {n['name']} ({addr[:18]}…) @ {n['url']}   [TOFU]"
-              + ('  +mesh' if idn.get('mailbox') else ''))
-    _save_json(STATE_FILE, st)
+        mates[node_name] = {'address': addr, 'public_key': pub, 'url': node_url}
+        if args.experimental_plaintext_mailbox and idn.get('mailbox'):
+            mates[node_name]['mailbox'] = idn['mailbox']
+        # Publish visible state before enabling a new inbound peer.  A crash
+        # between these writes is inconvenient but remains authorization-safe.
+        peers[addr] = pub
+        with exclusive_file_lock(STATE_LOCK_FILE, timeout=30.0):
+            if state() != original_state or load_peers() != original_peers:
+                sys.exit(
+                    'discovery trust state changed concurrently; retry the scan '
+                    'before storing this identity'
+                )
+            _save_json(STATE_FILE, st)
+            save_peers(peers)
+        print(f"✔ trusted {node_name} ({addr[:18]}…) @ {node_url}   [TOFU]"
+              + ('  !experimental-plaintext-mailbox'
+                 if args.experimental_plaintext_mailbox and idn.get('mailbox') else ''))
 
 
 def cmd_mesh_build(args) -> None:
-    """Build the Raven swarm mailbox binary once (needs Rust/cargo)."""
+    """Build the disabled-by-default plaintext mailbox experiment."""
     from team_agents.mesh import build_swarm_bin, find_swarm_bin
 
     existing = find_swarm_bin()
     if existing and not args.force:
         print('✔ already built:', existing)
         return
-    print('* building raven-swarm mailbox (first build takes a few minutes)…')
+    print('! building EXPERIMENTAL PLAINTEXT mailbox; this is not Raven E2EE')
+    print('* first Rust build can take a few minutes…')
     print('✔ built:', build_swarm_bin())
 
 
@@ -379,11 +1135,16 @@ def cmd_goal(args) -> None:
 def cmd_say(args) -> None:
     """Group-chat: `@agent task` routes it; `@all` fans out to everyone."""
     import asyncio
+    import team_agents.ui as ui
 
-    from team_agents.client import send_task
+    from team_agents.client import resolve_bearer_token, send_task
     from team_agents.chat import TeamChat, parse_mentions
     from team_agents.memory import TeamMemory
-    from team_agents.raven_identity import RavenIdentity, sign_delegation
+    from team_agents.raven_identity import (
+        MAX_DELEGATION_TTL_SECONDS,
+        RavenIdentity,
+        sign_delegation,
+    )
 
     st = state()
     if not st.get('name'):
@@ -391,12 +1152,35 @@ def cmd_say(args) -> None:
     mates = st.get('teammates', {})
     repo = Path(st.get('repo') or BASE / 'team-repo')
 
+    _ensure_unambiguous_mates(mates)
     mentions = parse_mentions(args.text, list(mates))
+    targets: list[tuple[str, dict]] = []
+    if mentions:
+        if mentions == ['@all']:
+            targets = list(mates.items())
+        else:
+            unknown = [m for m in mentions if m not in mates]
+            if unknown:
+                sys.exit(f'unknown teammate(s): {", ".join(unknown)}')
+            targets = [(n, mates[n]) for n in mentions]
+        direct_targets = {
+            name: mate
+            for name, mate in targets
+            if not args.relay and (mate.get('url') or args.url)
+        }
+        if direct_targets:
+            _reject_multi_peer_bearer(
+                resolve_bearer_token(token_file=args.token_file),
+                direct_targets,
+                'say fan-out',
+            )
+
     chat = TeamChat(TeamMemory(repo))
     chat.ensure()
     idn = RavenIdentity.load_or_create(repo / '.team' / 'keys')
 
-    # always visible in the shared thread (synced via git)
+    # Always visible in the shared thread (synced via git), but only after
+    # recipient and credential policy validation succeeds.
     chat.post(st['name'], args.text)
 
     if not mentions:
@@ -404,19 +1188,13 @@ def cmd_say(args) -> None:
               'use @name or @all inside the message.')
         return
 
-    if mentions == ['@all']:
-        targets = list(mates.items())
-    else:
-        unknown = [m for m in mentions if m not in mates]
-        if unknown:
-            sys.exit(f'unknown teammate(s): {", ".join(unknown)}')
-        targets = [(n, mates[n]) for n in mentions]
-
-    def _sign(text: str):
+    def _sign(text: str, peer_address: str):
         tid = uuid.uuid4().hex[:12]
         payload = {'id': tid, 'kind': 'task', 'from': idn.address,
-                   'to': '', 'text': text,
-                   'raven': sign_delegation(idn, text)}
+                   'to': peer_address, 'text': text,
+                   'raven': sign_delegation(
+                       idn, text, recipient=peer_address, task_id=tid,
+                       ttl_seconds=MAX_DELEGATION_TTL_SECONDS)}
         return tid, json.dumps(payload, ensure_ascii=False)
 
     binp = None
@@ -428,30 +1206,66 @@ def cmd_say(args) -> None:
 
     for tname, target in targets:
         peer_addr = target.get('address', '')
+        peer_pub = target.get('public_key', '')
         url = target.get('url') or args.url
         sent = False
 
         if not args.relay and url:
-            info = _probe(url)
+            try:
+                info = _probe(
+                    url,
+                    expected_address=peer_addr,
+                    expected_public_key=peer_pub,
+                    token_file=args.token_file,
+                )
+            except Exception as exc:
+                from team_agents.client import UnsafeBearerTransportError
+
+                if isinstance(exc, UnsafeBearerTransportError):
+                    sys.exit(f'refusing direct Bearer transport: {exc}')
+                raise
             if info is not None:
                 mb = info.get('mailbox')
-                if mb and target.get('mailbox') != mb:
+                if args.experimental_plaintext_mailbox and mb \
+                        and target.get('mailbox') != mb:
+                    _merge_teammate_state(
+                        tname,
+                        expected_address=peer_addr,
+                        expected_public_key=peer_pub,
+                        updates={'mailbox': mb},
+                    )
                     target['mailbox'] = mb
-                    _save_json(STATE_FILE, st)
                 try:
-                    result = asyncio.run(send_task(url, args.text,
-                                                   identity=idn, timeout=120))
+                    result = asyncio.run(send_task(
+                        url,
+                        args.text,
+                        identity=idn,
+                        expected_peer_address=peer_addr,
+                        expected_peer_public_key=peer_pub,
+                        token_file=args.token_file,
+                        timeout=120,
+                    ))
                     chat.post(tname, f'✅ done: {result.splitlines()[0][:100]}')
                     ui.ok(f'[direct] {tname}: ' + result.splitlines()[0][:110])
                     sent = True
                 except Exception as exc:  # noqa: BLE001
-                    ui.err(f'[direct] {tname}: {exc!r}'[:120])
+                    # Once request transmission begins, a lost response is
+                    # ambiguous: the peer may already have executed the task.
+                    # Automatic fallback would create a new task id and risk a
+                    # duplicate side effect.
+                    sys.exit(
+                        f'[direct] {tname}: delivery outcome is ambiguous; '
+                        'not falling back automatically. Check the peer task '
+                        f'history before retrying: {exc!r}'
+                    )
 
-        if not sent and binp and target.get('mailbox') and peer_addr:
+        if (not sent and args.experimental_plaintext_mailbox and binp
+                and target.get('mailbox') and peer_addr):
+            ui.warn('EXPERIMENTAL PLAINTEXT mailbox in use; task is not confidential')
             try:
                 from team_agents.mesh import make_task_object, mailbox_put
 
-                tid, payload_text = _sign(args.text)
+                tid, payload_text = _sign(args.text, peer_addr)
                 mailbox_put(binp, repo / '.team' / 'mesh-client',
                             target['mailbox']['multiaddr'],
                             target['mailbox']['peer_id'],
@@ -460,17 +1274,28 @@ def cmd_say(args) -> None:
                 ui.ok(f"[mesh] task {tid} waiting in {tname}'s raven box")
                 sent = True
             except Exception as exc:  # noqa: BLE001
-                ui.err(f'[mesh] {tname}: ' + str(exc)[:100])
+                # The mailbox subprocess may have stored the object before
+                # its response was lost.  A fresh Git task id would then
+                # permit the same side effect to run twice.
+                sys.exit(
+                    f'[mesh] {tname}: delivery outcome is ambiguous; not '
+                    'falling back automatically. Check the peer inbox before '
+                    f'retrying: {exc!r}'
+                )
 
         if not sent and peer_addr:
             from team_agents.relay import GitRelay
+            from team_agents.memory import TeamGitError
 
             r = GitRelay(TeamMemory(repo), idn,
                          trusted_peers_file=(str(PEERS_FILE)
                                              if PEERS_FILE.exists() else None),
                          trusted_peers=load_peers())
-            tid, _ = _sign(args.text)
-            f = r.send_task(peer_addr, args.text)
+            try:
+                f = r.send_task(peer_addr, args.text)
+            except TeamGitError as exc:
+                sys.exit(f'✗ [git-relay] not queued for {tname}: {exc}')
+            tid = json.loads(f.read_text(encoding='utf-8'))['id']
             chat.post(tname, f'📮 task {tid} parked in git relay')
             ui.warn(f'[git] task parked for {tname} → collect with ./rdap replies')
 
@@ -492,7 +1317,7 @@ def cmd_chat(args) -> None:
 
 def cmd_replies(args) -> None:
     """Collect offline answers that arrived through the git relay."""
-    from team_agents.memory import TeamMemory
+    from team_agents.memory import TeamGitError, TeamMemory
     from team_agents.raven_identity import RavenIdentity
     from team_agents.relay import GitRelay
 
@@ -502,44 +1327,183 @@ def cmd_replies(args) -> None:
     r = GitRelay(TeamMemory(repo), idn,
                  trusted_peers_file=str(PEERS_FILE) if PEERS_FILE.exists() else None,
                  trusted_peers=load_peers())
-    reps = r.take_replies()
+    try:
+        reps = r.take_replies()
+    except TeamGitError as exc:
+        sys.exit(f'✗ [git-relay] answers unavailable: {exc}')
     if not reps:
         print('(no offline answers yet)')
         return
     for rep in reps:
         print(f"← [{rep.get('at')}] {rep.get('from','?')[:16]}…:")
         print(f"   {rep.get('text','')}\n")
+    try:
+        r.ack_replies(reps)
+    except (TeamGitError, RuntimeError, ValueError) as exc:
+        sys.exit(
+            'answers were displayed but their relay acknowledgement is pending; '
+            f'the next run may repeat them: {exc}'
+        )
 
 
 # ------------------------------------------------------------------ ask --
-def _probe(url: str, seconds: float = 6.0):
-    """Quick reachability + identity check. Returns identity dict or None."""
+def _probe(
+    url: str,
+    seconds: float = 6.0,
+    *,
+    expected_address: str,
+    expected_public_key: str,
+    token_file: str = '',
+    raise_errors: bool = False,
+):
+    """Verify a pinned signed card and live identity before trusting an endpoint."""
     import httpx
+    from team_agents.client import (
+        UnsafeBearerTransportError,
+        get_bounded_json,
+        require_secure_bearer_transport,
+        resolve_bearer_token,
+        verify_agent_card_document,
+    )
+    from team_agents.raven_identity import (
+        fingerprint_for_public_key,
+        validate_address_public_key,
+    )
 
-    base = url.rstrip('/') + '/'
     try:
-        with httpx.Client(timeout=httpx.Timeout(seconds, connect=4.0)) as c:
-            c.get(base + 'health').raise_for_status()
-            return c.get(base + 'raven/identity').json()
+        node_url = _validated_node_url(url)
+        base = node_url.rstrip('/') + '/'
+        expected_key = validate_address_public_key(
+            expected_address, expected_public_key
+        ).hex()
+        token = resolve_bearer_token(token_file=token_file)
+        require_secure_bearer_transport(node_url, token)
+
+        # Agent Cards are public: never expose Bearer before the signed card
+        # proves this endpoint belongs to the already-pinned Raven identity.
+        direct_timeout = httpx.Timeout(seconds, connect=4.0)
+        with httpx.Client(timeout=direct_timeout, trust_env=False) as public_client:
+            card_document = get_bounded_json(
+                public_client,
+                base + '.well-known/agent-card.json'
+            )
+        verify_agent_card_document(
+            card_document,
+            expected_address=expected_address,
+            expected_public_key=expected_public_key,
+            expected_url=node_url,
+        )
+
+        headers = {'Authorization': f'Bearer {token}'} if token else None
+        with httpx.Client(
+            timeout=direct_timeout,
+            headers=headers,
+            trust_env=False,
+        ) as c:
+            with c.stream('GET', base + 'health') as health_response:
+                health_response.raise_for_status()
+            ident = get_bounded_json(c, base + 'raven/identity')
+            if not isinstance(ident, dict):
+                raise ValueError('remote identity response is not a JSON object')
+            if str(ident.get('address', '')) != expected_address:
+                raise ValueError('remote Raven address does not match the invite pin')
+            if str(ident.get('public_key', '')).lower() != expected_key:
+                raise ValueError('remote public key does not match the invite pin')
+            fingerprint = fingerprint_for_public_key(expected_key)
+            if str(ident.get('fingerprint', '')) != fingerprint:
+                raise ValueError('remote fingerprint does not match the pinned key')
+            if str(ident.get('card_kid', '')) != fingerprint + '-card':
+                raise ValueError('remote card key id does not match the pinned key')
+            return ident
+    except UnsafeBearerTransportError:
+        # This is a local policy violation, not ordinary reachability failure.
+        raise
     except Exception:  # noqa: BLE001
+        if raise_errors:
+            raise
         return None
 
 
 def cmd_ping(args) -> None:
-    url = args.url
-    print(f'→ probing {url} …')
-    info = _probe(url)
-    if not info:
-        print('✗ node unreachable. checklist:')
-        print('  1. is `./rdap start` running on the other Mac?')
-        print('  2. macOS Firewall there: System Settings ▸ Network ▸ Firewall '
-              '→ allow Python (or turn firewall off while testing)')
-        print('  3. both Macs on the same Wi-Fi/LAN?')
+    from team_agents.client import resolve_bearer_token
+
+    st = state()
+    requested_name = str(getattr(args, 'name', '') or '')
+    token_file = str(getattr(args, 'token_file', '') or '')
+    explicit_address = str(getattr(args, 'peer_address', '') or '')
+    explicit_public_key = str(getattr(args, 'peer_public_key', '') or '')
+
+    def ping_one(name: str, url: str, address: str, public_key: str) -> bool:
+        if not url:
+            print(f'✗ {name}: no url')
+            return False
+        if not address or not public_key:
+            print(f'✗ {name}: trusted Raven identity pin is incomplete')
+            return False
+        print(f'→ probing {name} at {url} …')
+        try:
+            info = _probe(
+                url,
+                expected_address=address,
+                expected_public_key=public_key,
+                token_file=token_file,
+            )
+        except Exception as exc:
+            from team_agents.client import UnsafeBearerTransportError
+
+            if isinstance(exc, UnsafeBearerTransportError):
+                print(f'✗ {name}: {exc}')
+                return False
+            raise
+        if not info:
+            print(f'✗ {name}: unreachable or pinned identity/auth did not verify')
+            return False
+        pol = info.get('policy', {})
+        print(f'✔ alive: {info["display"]}')
+        print(f'  signed-only={pol.get("require_signed_tasks")}')
+        return True
+
+    if requested_name.lower() == 'all':
+        if explicit_address or explicit_public_key:
+            sys.exit('--peer-address/--peer-public-key cannot be used with --name all')
+        targets = [
+            (name, mate) for name, mate in sorted(st.get('teammates', {}).items())
+            if mate.get('url')
+        ]
+        if not targets:
+            sys.exit('no teammates with a url')
+        _reject_multi_peer_bearer(
+            resolve_bearer_token(token_file=token_file),
+            dict(targets),
+            'ping all',
+        )
+        failed = [
+            name for name, mate in targets
+            if not ping_one(
+                name,
+                str(mate.get('url', '')),
+                str(mate.get('address', '')),
+                str(mate.get('public_key', '')),
+            )
+        ]
+        if failed:
+            sys.exit(1)
+        return
+
+    mate: dict = {}
+    display_name = requested_name or 'peer'
+    if requested_name:
+        display_name, mate = _resolve_mate(st, requested_name)
+    url = str(getattr(args, 'url', '') or mate.get('url', ''))
+    if not url:
+        sys.exit(f'no url for "{display_name}" — pass one or re-run trust/discover')
+    expected_address = explicit_address or str(mate.get('address', ''))
+    expected_public_key = explicit_public_key or str(mate.get('public_key', ''))
+    if not expected_address or not expected_public_key:
+        sys.exit('ping requires --name for a trusted teammate or both pinned identity flags')
+    if not ping_one(display_name, url, expected_address, expected_public_key):
+        print('  checklist: is the node running, reachable, and using the expected token?')
         sys.exit(1)
-    pol = info.get('policy', {})
-    print(f'✔ alive: {info["display"]}')
-    print(f'  signed-only={pol.get("require_signed_tasks")} '
-          f'peers={len(pol.get("trusted_peers", []))}')
 
 
 def cmd_ask(args) -> None:
@@ -562,7 +1526,8 @@ def cmd_ask(args) -> None:
         if not target:
             sys.exit(f'unknown teammate "{args.name}" — run `./rdap trust` first')
         if not (target.get('url') or args.url) and not args.relay \
-                and not target.get('mailbox'):
+                and not (args.experimental_plaintext_mailbox
+                         and target.get('mailbox')):
             sys.exit(f'no url known for "{args.name}" — re-run `./rdap trust` '
                      'with --url, or use --relay to go offline')
     elif len(mates) == 1:
@@ -574,46 +1539,94 @@ def cmd_ask(args) -> None:
         for i, nm in enumerate(mates, 1):
             print(f'  {i}. {nm}')
         pick = input('#? ').strip()
-        target_name, target = list(mates.items())[int(pick) - 1]
+        try:
+            selection = int(pick)
+        except ValueError:
+            sys.exit(f'pick must be a number between 1 and {len(mates)}')
+        if not 1 <= selection <= len(mates):
+            sys.exit(f'pick must be between 1 and {len(mates)}')
+        target_name, target = list(mates.items())[selection - 1]
 
-    url = args.url or (target or {}).get('url', '')
-    if args.url and target is not None:
-        target['url'] = args.url
-        _save_json(STATE_FILE, st)
+    try:
+        explicit_url = _validated_node_url(args.url) if args.url else ''
+    except ValueError as exc:
+        sys.exit(f'invalid --url: {exc}')
+    url = explicit_url or (target or {}).get('url', '')
     peer_addr = (target or {}).get('address', '')
+    peer_pub = (target or {}).get('public_key', '')
     repo = Path(st.get('repo') or BASE / 'team-repo')
     idn = RavenIdentity.load_or_create(repo / '.team' / 'keys')
 
     # ---------------- RDAP Transport Manager ladder -----------------------
     # T1 direct A2A · T2/T3 raven-swarm mailbox · T4 git relay
     def _sign_payload() -> tuple[str, str]:
-        from team_agents.raven_identity import sign_delegation
+        from team_agents.raven_identity import (
+            MAX_DELEGATION_TTL_SECONDS,
+            sign_delegation,
+        )
 
         tid = uuid.uuid4().hex[:12]
         payload = {
             'id': tid, 'kind': 'task', 'from': idn.address,
             'to': peer_addr, 'text': args.text,
-            'raven': sign_delegation(idn, args.text),
+            'raven': sign_delegation(
+                idn,
+                args.text,
+                recipient=peer_addr,
+                task_id=tid,
+                ttl_seconds=MAX_DELEGATION_TTL_SECONDS,
+            ),
         }
         return tid, json.dumps(payload, ensure_ascii=False)
 
     if not args.relay and url:
         print(ui.dim(ARROW + f' checking {target_name} at {url} …'))
-        info = _probe(url)
+        try:
+            info = _probe(
+                url,
+                expected_address=peer_addr,
+                expected_public_key=peer_pub,
+                token_file=args.token_file,
+            )
+        except Exception as exc:
+            from team_agents.client import UnsafeBearerTransportError
+
+            if isinstance(exc, UnsafeBearerTransportError):
+                sys.exit(f'refusing direct Bearer transport: {exc}')
+            raise
         if info is not None:
             mb = info.get('mailbox')
-            if mb and target is not None and target.get('mailbox') != mb:
-                target['mailbox'] = mb          # remember for future fallback
-                _save_json(STATE_FILE, st)
+            teammate_updates = {}
+            if explicit_url and target is not None and target.get('url') != explicit_url:
+                teammate_updates['url'] = explicit_url
+            if (args.experimental_plaintext_mailbox and mb and target is not None
+                    and target.get('mailbox') != mb):
+                teammate_updates['mailbox'] = mb
+            if teammate_updates:
+                _merge_teammate_state(
+                    str(target_name),
+                    expected_address=peer_addr,
+                    expected_public_key=peer_pub,
+                    updates=teammate_updates,
+                )
+                target.update(copy.deepcopy(teammate_updates))
             print(f'✔ {target_name} alive — sending task …')
-            result = asyncio.run(send_task(url, args.text,
-                                           identity=idn, timeout=90))
+            result = asyncio.run(send_task(
+                url,
+                args.text,
+                identity=idn,
+                expected_peer_address=peer_addr,
+                expected_peer_public_key=peer_pub,
+                token_file=args.token_file,
+                timeout=90,
+            ))
             print(result)
             return
         ui.err('[direct] unreachable')
 
     # T3 — raven swarm offline mailbox (task lands in THEIR store)
-    if not args.git_only:
+    if args.experimental_plaintext_mailbox and not args.git_only:
+        ui.warn('EXPERIMENTAL PLAINTEXT mailbox requested; task is not confidential')
         from team_agents.mesh import find_swarm_bin, make_task_object, mailbox_put
 
         binp = find_swarm_bin()
@@ -630,7 +1643,14 @@ def cmd_ask(args) -> None:
                 print('   ./rdap replies')
                 return
             except Exception as exc:  # noqa: BLE001
-                print(f'✗ [T3] mesh put failed ({exc!r}) — falling to git …')
+                # PUT failure is ambiguous: the remote store may have
+                # accepted the object before the acknowledgement was lost.
+                # Never manufacture a second task id on another transport.
+                sys.exit(
+                    '✗ [T3] mesh delivery outcome is ambiguous; not falling '
+                    'to git automatically. Check the peer inbox before '
+                    f'retrying: {exc!r}'
+                )
 
     # T4 — git relay
     use_relay = True
@@ -648,8 +1668,14 @@ def cmd_ask(args) -> None:
                  trusted_peers_file=(str(PEERS_FILE)
                                      if PEERS_FILE.exists() else None),
                  trusted_peers=load_peers())
-    tid, payload_text = _sign_payload()
-    f = r.send_task(peer_addr, args.text)
+    try:
+        f = r.send_task(peer_addr, args.text)
+    except Exception as exc:  # TeamGitError plus bounded Git subprocess failures
+        from team_agents.memory import TeamGitError
+
+        if isinstance(exc, TeamGitError):
+            sys.exit(f'✗ [T4 git-relay] not queued: {exc}')
+        raise
     print(f'✔ [T4 git-relay] queued {f.relative_to(repo)}')
     print('   collect answers later with:  ./rdap replies')
 
@@ -699,7 +1725,9 @@ def _menu() -> None:
         ('chat', 'read the shared thread', './rdap chat'),
         ('status', "what's happening", './rdap status'),
     ):
-        print(f'  {bold(cmd.ljust(8))} {dim(desc.ljust(26))} {cyan(ex)}')
+        print(
+            f'  {ui.bold(cmd.ljust(8))} {ui.dim(desc.ljust(26))} {ui.cyan(ex)}'
+        )
     print()
 
 def cmd_status(args) -> None:
@@ -726,7 +1754,8 @@ def cmd_status(args) -> None:
         ('raven id', st.get('address', '?')),
         ('goal    ', (goal[:40] + '…') if len(goal) > 44 else (goal or 'not set')),
         ('team    ', ', '.join(mates) if mates else 'nobody yet'),
-        ('mesh    ', 'ready' if find_swarm_bin() else 'not built (./rdap mesh-build)'),
+        ('mailbox ', ('experimental binary present (disabled by default)'
+                      if find_swarm_bin() else 'experimental binary not built')),
         ('repo    ', str(st.get('repo', ''))),
     ], title='RDAP status')
 
@@ -751,8 +1780,269 @@ def cmd_board(args) -> None:
               f"{ui.dim(r['owner'])} {ui.dim(r['status'])}")
 
 
+def _expand_dotargv(argv: list[str]) -> list[str]:
+    """Expand worker.do/worker.ask/worker.ping command shorthand.
+
+    ``do`` takes the teammate as a positional target; ``ask`` and ``ping``
+    take it through ``--name``. Returns argv unchanged when there is no match.
+    """
+    import re
+
+    if len(argv) > 1:
+        m = re.fullmatch(r'([A-Za-z0-9_.-]+)\.(do|ask|ping)', argv[1])
+        if m:
+            target, command = m.groups()
+            if command == 'do':
+                return [argv[0], command, target] + argv[2:]
+            return [argv[0], command, '--name', target] + argv[2:]
+    return argv
+
+
+def _resolve_mate(st: dict, want: str) -> tuple[str, dict]:
+    """Resolve one exact normalized name, or one unambiguous prefix."""
+    mates = st.get('teammates', {})
+    key = _normalized_mate_name(want)
+    if not key:
+        sys.exit('invalid teammate name — target cannot normalize to an empty value')
+    normalized = {
+        name: _normalized_mate_name(name) for name in mates
+    }
+    exact = [name for name, candidate in normalized.items() if candidate == key]
+    if len(exact) == 1:
+        name = exact[0]
+        return name, mates[name]
+    if len(exact) > 1:
+        sys.exit(f'ambiguous teammate "{want}" — exact aliases: {", ".join(sorted(exact))}')
+    prefixes = [name for name, candidate in normalized.items() if candidate.startswith(key)]
+    if len(prefixes) == 1:
+        name = prefixes[0]
+        return name, mates[name]
+    if len(prefixes) > 1:
+        sys.exit(f'ambiguous teammate "{want}" — matches: {", ".join(sorted(prefixes))}')
+    sys.exit(f'unknown teammate "{want}" — known: {", ".join(mates) or "(none)"}')
+
+
+def cmd_do(args) -> None:
+    """Shortest path to delegate:  ./rdap do WORKER "text"  |  do all "text"."""
+    import asyncio
+
+    from team_agents.client import (
+        UnsafeBearerTransportError,
+        require_secure_bearer_transport,
+        resolve_bearer_token,
+        send_task,
+    )
+    from team_agents.raven_identity import RavenIdentity
+
+    st = state()
+    if not st.get('name'):
+        sys.exit('run `./rdap init` first')
+    repo = Path(st.get('repo') or BASE / 'team-repo')
+    idn = RavenIdentity.load_or_create(repo / '.team' / 'keys')
+
+    if args.target.lower() == 'all':
+        targets = {nm: m for nm, m in st.get('teammates', {}).items() if m.get('url')}
+        if not targets:
+            sys.exit('no teammates with a url — run `./rdap discover --trust all`')
+    else:
+        nm, mate = _resolve_mate(st, args.target)
+        if not mate.get('url'):
+            sys.exit(f'no url for "{nm}" — re-run `./rdap discover --trust all`')
+        targets = {nm: mate}
+
+    token = resolve_bearer_token(token_file=args.token_file)
+    _reject_multi_peer_bearer(token, targets, 'do all')
+    try:
+        for mate in targets.values():
+            require_secure_bearer_transport(str(mate['url']), token)
+    except UnsafeBearerTransportError as exc:
+        sys.exit(str(exc))
+
+    async def _run():
+        import asyncio as _aio
+
+        results = await _aio.gather(
+            *(send_task(
+                m['url'],
+                args.text,
+                identity=idn,
+                expected_peer_address=str(m.get('address', '')),
+                expected_peer_public_key=str(m.get('public_key', '')),
+                token_file=args.token_file,
+                timeout=90,
+            )
+              for m in targets.values()),
+            return_exceptions=True)
+        return list(zip(targets, results))
+
+    delegated = asyncio.run(_run())
+    failures = 0
+    for nm, res in delegated:
+        if isinstance(res, BaseException):
+            failures += 1
+        head = res.splitlines()[0] if isinstance(res, str) and res else repr(res)
+        print(f'{nm}: {head}')
+    if failures:
+        sys.exit(f'{failures} of {len(delegated)} delegation(s) failed')
+
+
+def cmd_ls(args) -> None:
+    """One line per teammate: name, url, alive, last activity."""
+    import httpx
+    from team_agents.client import (
+        UnsafeBearerTransportError,
+        require_secure_bearer_transport,
+        resolve_bearer_token,
+    )
+
+    st = state()
+    me = st.get('name', '?')
+    print(f'me: {me}  ({st.get("address", "?")[:18]}…)')
+    mates = st.get('teammates', {})
+    if not mates:
+        print('teammates: (none) — ./rdap discover --trust all')
+        return
+    token = resolve_bearer_token(token_file=args.token_file)
+    network_targets = {
+        name: mate for name, mate in mates.items() if mate.get('url')
+    }
+    _reject_multi_peer_bearer(token, network_targets, 'ls')
+    try:
+        for mate in mates.values():
+            if mate.get('url'):
+                require_secure_bearer_transport(str(mate['url']), token)
+    except UnsafeBearerTransportError as exc:
+        sys.exit(str(exc))
+    headers = {'Authorization': f'Bearer {token}'} if token else None
+    for nm, m in sorted(mates.items()):
+        url = m.get('url', '')
+        last = '(no url)'
+        if url:
+            try:
+                info = _probe(
+                    url,
+                    seconds=4,
+                    expected_address=str(m.get('address', '')),
+                    expected_public_key=str(m.get('public_key', '')),
+                    token_file=args.token_file,
+                )
+                if info is None:
+                    raise ValueError('pinned identity/auth did not verify')
+                with httpx.Client(
+                    timeout=4, headers=headers, trust_env=False
+                ) as activity_client:
+                    response = activity_client.get(
+                        url.rstrip('/') + '/raven/activity',
+                        params={'limit': 1},
+                    )
+                if response.status_code == 403:
+                    last = 'alive; activity auth disabled/required'
+                else:
+                    response.raise_for_status()
+                    evs = response.json().get('events', [])
+                    last = f'{evs[0]["text"][:60]}' if evs else 'alive, quiet'
+            except Exception:  # noqa: BLE001
+                last = '✗ unreachable'
+        print(f'  {nm:22} {url or "-":32} {last}')
+
+
+def cmd_watch(args) -> None:
+    """Live dashboard of every agent — zero input, Ctrl+C to leave."""
+    import httpx
+    from team_agents.client import (
+        UnsafeBearerTransportError,
+        require_secure_bearer_transport,
+        resolve_bearer_token,
+    )
+
+    st = state()
+    if not st.get('name'):
+        sys.exit('run `./rdap init` first')
+    repo = Path(st.get('repo') or BASE / 'team-repo')
+
+    from team_agents.memory import TeamMemory
+
+    mem = TeamMemory(repo)
+    token = resolve_bearer_token(token_file=args.token_file)
+    network_targets = {
+        name: mate
+        for name, mate in st.get('teammates', {}).items()
+        if mate.get('url')
+    }
+    _reject_multi_peer_bearer(token, network_targets, 'watch')
+    try:
+        for mate in st.get('teammates', {}).values():
+            if mate.get('url'):
+                require_secure_bearer_transport(str(mate['url']), token)
+    except UnsafeBearerTransportError as exc:
+        sys.exit(str(exc))
+    headers = {'Authorization': f'Bearer {token}'} if token else None
+
+    def fetch(mate: dict):
+        url = str(mate.get('url', ''))
+        if not url:
+            return 'unreachable', []
+        try:
+            info = _probe(
+                url,
+                seconds=4,
+                expected_address=str(mate.get('address', '')),
+                expected_public_key=str(mate.get('public_key', '')),
+                token_file=args.token_file,
+            )
+            if info is None:
+                return 'unreachable', []
+            with httpx.Client(
+                timeout=4, headers=headers, trust_env=False
+            ) as activity_client:
+                r = activity_client.get(
+                    url.rstrip('/') + '/raven/activity',
+                    params={'limit': args.lines},
+                )
+            if r.status_code == 403:
+                return 'restricted', []
+            r.raise_for_status()
+            return 'ok', r.json().get('events', [])
+        except Exception:  # noqa: BLE001
+            return 'unreachable', []
+
+    def fmt(evs) -> list[str]:
+        out = []
+        for e in evs or []:
+            t = time.strftime('%H:%M:%S', time.localtime(e.get('at', 0)))
+            who = str(e.get('w', '?'))
+            out.append(f'      {t}  {who[:14]:14} {str(e.get("text", ""))[:70]}')
+        return out or ['      (quiet)']
+
+    try:
+        while True:
+            panels = [f'\033[2J\033[H',   # clear screen + home
+                      f'RDAP live — {time.strftime("%Y-%m-%d %H:%M:%S")}'
+                      f'   (Ctrl+C to exit)']
+            local = mem.recent_events(args.lines)
+            panels.append(f'── {st["name"]} @ local ──────────────')
+            panels += fmt(local)
+            for nm, m in sorted(st.get('teammates', {}).items()):
+                url = m.get('url', '')
+                fetch_state, evs = fetch(m)
+                if fetch_state == 'restricted':
+                    state_txt = '  alive; activity auth disabled/required'
+                elif fetch_state == 'unreachable':
+                    state_txt = '  ✗ unreachable'
+                else:
+                    state_txt = ''
+                panels.append(f'── {nm} @ {url or "?"}{state_txt} ──────')
+                panels += fmt(evs)
+            print('\n'.join(panels), flush=True)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print('\nbye.')
+
+
 def main() -> None:
     import argparse
+
+    sys.argv = _expand_dotargv(sys.argv)
 
     if len(sys.argv) == 1:
         return _menu()
@@ -767,25 +2057,53 @@ def main() -> None:
                    help='skip the internet question with --internet/--no-internet')
     i.set_defaults(fn=cmd_init)
 
+    rs = sub.add_parser(
+        'relay-setup', help='configure the shared Git remote used by offline relay'
+    )
+    rs.add_argument('remote_url', help='private Git remote URL (or a local bare repo)')
+    rs.set_defaults(fn=cmd_relay_setup)
+
     t = sub.add_parser('trust', help="register a teammate's invite")
-    t.add_argument('invite', nargs='?', help='RDAP1 … line (or leave empty to paste)')
-    t.add_argument('--url', default='', help='their node url if you know it')
+    t.add_argument(
+        'invite', nargs='?',
+        help='four-field RDAP1 line, optionally followed by its http(s) URL',
+    )
+    t.add_argument('--url', default='', help='verified node URL when invite has none')
+    t.add_argument('--token-file', default='', help='Bearer token file for identity fetch')
+    t.add_argument(
+        '--experimental-plaintext-mailbox', action='store_true',
+        help='capture explicitly enabled non-confidential mailbox coordinates',
+    )
     t.set_defaults(fn=cmd_trust)
 
     s = sub.add_parser('start', help='serve this agent')
     s.add_argument('--port', type=int, default=0)
     s.add_argument('--ip', default='', help='override advertised ip')
-    s.add_argument('--provider', default='', help='echo | openai (overrides saved)')
+    s.add_argument(
+        '--provider', default='',
+        help='echo | openai | groq | openrouter | ollama | custom (overrides saved)',
+    )
     s.add_argument('--model', default='')
     s.add_argument('--base-url', default='', help='OpenAI-compatible endpoint')
     s.add_argument('--allow-shell', action='store_true')
     s.add_argument('--poll', type=int, default=0,
                    help='mesh/git drain interval seconds (default 20)')
-    s.add_argument('--open', action='store_true', help='accept unsigned tasks too')
+    s.add_argument(
+        '--open', action='store_true',
+        help='DANGEROUS: explicitly accept unsigned tasks from reachable clients',
+    )
+    s.add_argument('--token-file', default='', help='read server Bearer token from file')
+    s.add_argument(
+        '--experimental-plaintext-mailbox', action='store_true',
+        help='DANGEROUS/EXPERIMENTAL: enable non-confidential mailbox adapter',
+    )
     s.set_defaults(fn=cmd_start)
 
     m = sub.add_parser('model', help='choose this agent\'s brain (LLM)')
-    m.add_argument('provider', nargs='?', default='', help='openai | echo')
+    m.add_argument(
+        'provider', nargs='?', default='',
+        help='echo | openai | groq | openrouter | ollama | custom',
+    )
     m.add_argument('model', nargs='?', default='')
     m.add_argument('--base-url', default='',
                    help='e.g. http://localhost:11434/v1 for Ollama')
@@ -800,19 +2118,37 @@ def main() -> None:
                    help='skip live attempt, queue via git relay directly')
     a.add_argument('--git-only', action='store_true',
                    help='skip mesh mailbox, use git relay as the fallback')
+    a.add_argument('--token-file', default='', help='Bearer token file for direct A2A')
+    a.add_argument(
+        '--experimental-plaintext-mailbox', action='store_true',
+        help='explicitly allow the non-confidential experimental mailbox fallback',
+    )
     a.set_defaults(fn=cmd_ask)
 
     g = sub.add_parser('ping', help='check whether a teammate node is reachable')
-    g.add_argument('url', help='http://<ip>:<port>')
+    g.add_argument('url', nargs='?', default='', help='http://<ip>:<port>')
+    g.add_argument('--name', default='', help='trusted teammate name (fuzzy) or "all"')
+    g.add_argument('--peer-address', default='', help='pinned RVN address')
+    g.add_argument('--peer-public-key', default='', help='pinned Ed25519 public key')
+    g.add_argument('--token-file', default='', help='Bearer token file')
     g.set_defaults(fn=cmd_ping)
 
     v = sub.add_parser('invite', help='print your invite line (add --port for url)')
     v.add_argument('--port', type=int, default=0)
+    v.add_argument('--ip', default='', help='explicit advertised LAN IP/host')
     v.set_defaults(fn=cmd_invite)
 
     d = sub.add_parser('discover', help='find nearby agents on this LAN (mDNS)')
     d.add_argument('--timeout', type=float, default=4.0)
     d.add_argument('--trust', default='', help="number from list, or 'all'")
+    d.add_argument(
+        '--token-file', default='',
+        help='rejected for TOFU discovery; use signed invite + manual trust',
+    )
+    d.add_argument(
+        '--experimental-plaintext-mailbox', action='store_true',
+        help='capture explicitly enabled non-confidential mailbox coordinates',
+    )
     d.set_defaults(fn=cmd_discover)
 
     rr = sub.add_parser('replies', help='collect offline answers from git relay')
@@ -826,6 +2162,11 @@ def main() -> None:
     sy.add_argument('text', help='e.g. "@raphael build the login API"')
     sy.add_argument('--url', default='')
     sy.add_argument('--relay', action='store_true')
+    sy.add_argument('--token-file', default='', help='Bearer token file for direct A2A')
+    sy.add_argument(
+        '--experimental-plaintext-mailbox', action='store_true',
+        help='explicitly allow the non-confidential experimental mailbox fallback',
+    )
     sy.set_defaults(fn=cmd_say)
 
     ch = sub.add_parser('chat', help='show the shared team thread')
@@ -833,13 +2174,27 @@ def main() -> None:
     ch.set_defaults(fn=cmd_chat)
 
     stt = sub.add_parser('status', help='one-glance dashboard')
+
+    w = sub.add_parser('watch', help='live dashboard of all agents (no input)')
+    w.add_argument('--interval', type=float, default=3.0, help='refresh seconds')
+    w.add_argument('--lines', type=int, default=6, help='events per panel')
+    w.add_argument('--token-file', default='', help='Bearer token file for peers')
+    d2 = sub.add_parser('do', help='short delegation: do WORKER "text" | do all "text"')
+    d2.add_argument('target', help='teammate name (fuzzy) or "all"')
+    d2.add_argument('text')
+    d2.add_argument('--token-file', default='', help='Bearer token file for direct A2A')
+    l2 = sub.add_parser('ls', help='list teammates + last activity')
+    l2.add_argument('--token-file', default='', help='Bearer token file for peers')
     stt.set_defaults(fn=cmd_status)
+    w.set_defaults(fn=cmd_watch)
+    d2.set_defaults(fn=cmd_do)
+    l2.set_defaults(fn=cmd_ls)
 
     bd = sub.add_parser('board', help='show the shared task board')
     bd.set_defaults(fn=cmd_board)
 
     mb = sub.add_parser('mesh-build',
-                        help='build the Raven swarm mailbox binary (Rust)')
+                        help='build EXPERIMENTAL PLAINTEXT mailbox binary (disabled by default)')
     mb.add_argument('--force', action='store_true')
     mb.set_defaults(fn=cmd_mesh_build)
 

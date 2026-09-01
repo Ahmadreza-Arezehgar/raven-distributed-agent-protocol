@@ -50,10 +50,6 @@ def warn(msg: str) -> None:
     print(yellow('!') + f' {msg}')
 
 
-def kv(key: str, value: str) -> None:
-    print(f'  {dim(f"{key:<8}")} {value}')
-
-
 def box(lines: list[tuple[str, str]], title: str = '') -> None:
     """Render an aligned two-column status box."""
     KEY_W = 10

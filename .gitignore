@@ -7,3 +7,11 @@ __pycache__/
 .team/keys/
 device_ed25519.seed
 *.seed
+
+# RDAP runtime state — never commit (private key seeds, replay caches, relays)
+.team/
+peers.json
+rdap.json
+.rdap-state.lock
+team-repo/
+.venv.rdap-backup.*/
