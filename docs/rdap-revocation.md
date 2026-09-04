@@ -85,9 +85,12 @@ RDAP’s file is an **address deny-list** only.
   here does not revoke a RAVEN device lineage.
 - Dual-stack operators MUST run **both** checklists until a real bridge
   exists.
-- Data-plane ATSAM fail-closed when a lineage is revoked is a **RAVEN /
-  raven-node** behavior. It is separate from this layer-A file deny. RDAP
-  does not currently speak ATSAM (see lifecycle §9.5).
+- **R → fail-closed on bound data-plane** (ATSAM / LanDial / task) when an
+  accepted RVDR1 covers the **device lineage material in use** is
+  lineage-scoped and **separate** from this address deny-list. The
+  predicate is covering **lineage ids**, **not** pin ≡ `device_ed_pub` and
+  **not** an auto `revocations_file` entry (playbook A / RAVEN G5 §2.2,
+  Architect ruling). RDAP does not currently speak ATSAM (lifecycle §9.5).
 
 ---
 
@@ -115,7 +118,8 @@ not “operator affirmed an empty deny-list.”
 ## 4. Cross-links
 
 - Lifecycle (transport, cancel I2, delegation): [`rdap-task-lifecycle.md`](rdap-task-lifecycle.md)
-- RAVEN G5 playbook (other repo): [PR #5](https://github.com/Raven-ASHCO/RAVEN/pull/5) /
+- RAVEN G5 playbook (other repo): [PR #5](https://github.com/Raven-ASHCO/RAVEN/pull/5)
+  (`§2.2`) /
   [`docs/engineering/G5_CROSS_STACK_REVOKE_POLICY.md`](https://github.com/Raven-ASHCO/RAVEN/blob/cursor/sprint0-identity-threat-model-d3a8/docs/engineering/G5_CROSS_STACK_REVOKE_POLICY.md)
-  on branch `cursor/sprint0-identity-threat-model-d3a8` (not yet on `main` at
-  the time of this note)
+  on PR #5 branch `cursor/sprint0-identity-threat-model-d3a8` (still absent
+  from `main` at the time of this note)
