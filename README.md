@@ -57,6 +57,8 @@ content-aware data-loss prevention: keep secrets outside the delegated project
 tree. Trusting a peer is not a project-write or shell grant unless the receiving
 operator also enables `--allow-shell`.
 
+Sprint 0 freeze of task, auth, and cancellation semantics (including open gaps): [`docs/rdap-task-lifecycle.md`](docs/rdap-task-lifecycle.md).
+
 Keep tokens out of argv and use mode `0600` on POSIX. Inbound server secrets are
 `TEAM_AUTH_TOKEN[_FILE]`; outbound peer credentials are separately
 `RDAP_BEARER_TOKEN[_FILE]` or a command's `--token-file`. RDAP never falls back
