@@ -312,6 +312,9 @@ check before `verify_delegation`.
   `max(1, task_store.max_count)`.
 - Get / List / Subscribe / Cancel on a task the caller does not own MUST
   behave as not-found, not as a cross-owner status leak.
+- Cancel and both auth planes consult the **RVN1 address** deny-list when a
+  revocations path is configured. Unit, footgun, and signed-mode require-file
+  policy: [`rdap-revocation.md`](rdap-revocation.md).
 
 ### 7.2 Bounds and eviction
 
@@ -450,6 +453,13 @@ session actor. Unifying RDAP with the node identity / protected store and
 encrypted Raven carrier is a **cross-repo integration** gap (README
 “Important integration gap”). It is out of scope for this PR.
 
+### 9.6 Signed-mode revocations file not required at start
+
+**Decided policy (Sprint 0 / G5–G6, Identity AuthZ):** signed mode MUST have
+an explicit revocations file path (empty `[]` OK). **Current code** still
+treats an unset path as a silent empty set; `rdap init` does not write a
+default file. Not claimed enforced. See [`rdap-revocation.md`](rdap-revocation.md).
+
 ---
 
 ## 10. Document history
@@ -457,3 +467,4 @@ encrypted Raven carrier is a **cross-repo integration** gap (README
 | Rev | Notes |
 |---|---|
 | Sprint 0 freeze draft (O5) | Role #13 protocol note from current code. Cancel skew recorded as an open O5 gap owned by Role #14; runtime fix held for Sprint 1. |
+| G5 revocation sibling | Pointers to [`rdap-revocation.md`](rdap-revocation.md) (address unit + signed-mode require-file as decided policy, not yet start-enforced). |
