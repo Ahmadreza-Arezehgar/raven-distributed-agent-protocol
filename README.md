@@ -50,6 +50,16 @@ The default server rejects unsigned RPC traffic and unsigned tasks. A trusted pe
   a read-policy bypass, but that instruction is not an OS sandbox.
 - `--open` is an explicit dangerous override that accepts unsigned reachable traffic.
 
+### OPEN MODE
+
+`require_signed_tasks=false` / `TEAM_REQUIRE_SIGNED=0` / `--open` accepts unsigned
+traffic and makes **no** authorization claim. This is a lab/local escape hatch
+only. It **MUST NOT** be the default for shared team demos, staging that claims
+security, or any environment reachable by untrusted clients. Keep the loud
+`⚠ OPEN MODE` agent-card warning. The same rule is documented in RAVEN
+`docs/engineering/SPRINT0_IDENTITY_THREAT_MODEL.md` (sibling product repo; this
+snapshot does not depend on that file).
+
 A trusted, signed task still has the intended default authority to read ordinary,
 non-sensitive project files and mutate shared team memory (`.team` board, facts,
 journal, locks, and outputs). The filename/path policy is defense in depth, not
