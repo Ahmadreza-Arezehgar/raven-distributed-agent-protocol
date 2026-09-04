@@ -1,0 +1,20 @@
+# RDAP (raven-distributed-agent-protocol) CODEOWNERS — Raven-ASHCO
+
+*                                                         @Raven-ASHCO/rdap @Raven-ASHCO/protocol @Raven-ASHCO/release
+
+/.github/                                                 @Raven-ASHCO/release @Raven-ASHCO/assurance
+/SECURITY.md                                              @Raven-ASHCO/assurance @Raven-ASHCO/architecture
+/protocol/                                                @Raven-ASHCO/protocol @Raven-ASHCO/rdap
+/team_agents/                                             @Raven-ASHCO/rdap
+/team_agents/raven_identity.py                            @Raven-ASHCO/identity @Raven-ASHCO/rdap
+/team_agents/server.py                                    @Raven-ASHCO/rdap
+/team_agents/client.py                                    @Raven-ASHCO/rdap
+/team_agents/executor.py                                  @Raven-ASHCO/rdap
+/team_agents/task_store.py                                @Raven-ASHCO/rdap @Raven-ASHCO/assurance
+/team_agents/relay.py                                     @Raven-ASHCO/rdap @Raven-ASHCO/network
+/team_agents/tools.py                                     @Raven-ASHCO/rdap @Raven-ASHCO/identity
+/team_agents/llm.py                                       @Raven-ASHCO/rdap
+/team_agents/memory.py                                    @Raven-ASHCO/rdap
+/team_agents/selftest.py                                  @Raven-ASHCO/rdap @Raven-ASHCO/assurance
+/requirements.txt                                         @Raven-ASHCO/rdap @Raven-ASHCO/release
+/requirements.lock.txt                                    @Raven-ASHCO/rdap @Raven-ASHCO/release
