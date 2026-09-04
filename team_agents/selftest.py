@@ -340,7 +340,11 @@ def unit_tests() -> None:
         except Exception:  # noqa: BLE001
             check('broken revocation policy fails closed', True)
 
-        check('signed tasks required by default', NodeConfig().require_signed_tasks is True)
+        check(
+            'OPEN MODE is not the NodeConfig default '
+            '(shared/prod demos must not default open)',
+            NodeConfig().require_signed_tasks is True,
+        )
         unsafe_names_rejected = True
         for unsafe_name in ('.', '..', 'CON', '../escape', 'a/b', 'x' * 65):
             try:
