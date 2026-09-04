@@ -4,6 +4,7 @@
 
 /.github/                                                 @Raven-ASHCO/release @Raven-ASHCO/assurance
 /SECURITY.md                                              @Raven-ASHCO/assurance @Raven-ASHCO/architecture
+/docs/                                                    @Raven-ASHCO/assurance @Raven-ASHCO/architecture @Raven-ASHCO/rdap
 /protocol/                                                @Raven-ASHCO/protocol @Raven-ASHCO/rdap
 /team_agents/                                             @Raven-ASHCO/rdap
 /team_agents/raven_identity.py                            @Raven-ASHCO/identity @Raven-ASHCO/rdap
