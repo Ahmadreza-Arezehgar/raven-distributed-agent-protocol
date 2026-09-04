@@ -69,6 +69,10 @@ operator also enables `--allow-shell`.
 
 Sprint 0 freeze of task, auth, and cancellation semantics (including open gaps): [`docs/rdap-task-lifecycle.md`](docs/rdap-task-lifecycle.md).
 
+The LLM runtime law, the `OpenAIBrain` → `ToolBox.dispatch` call path, operator
+guidance for `--allow-shell` / `TEAM_ALLOW_SHELL`, and the Sprint 0 residual-risk
+checklist live in [`docs/llm-runtime-boundary.md`](docs/llm-runtime-boundary.md).
+
 Keep tokens out of argv and use mode `0600` on POSIX. Inbound server secrets are
 `TEAM_AUTH_TOKEN[_FILE]`; outbound peer credentials are separately
 `RDAP_BEARER_TOKEN[_FILE]` or a command's `--token-file`. RDAP never falls back
