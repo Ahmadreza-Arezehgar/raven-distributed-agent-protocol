@@ -1,0 +1,26 @@
+# Dependabot version updates for RDAP.
+# Security alerts / Dependabot security updates are enabled at repo settings
+# and do not require entries here.
+version: 2
+updates:
+  # Human-maintained constraints (requirements.txt) and the pip-compile
+  # hash lock (requirements.lock.txt) both live at the repository root.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 8
+
+  # Workflows live in /.github/workflows. The github-actions ecosystem
+  # requires directory: "/" so Dependabot searches that default location.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
